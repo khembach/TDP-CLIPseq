@@ -1,0 +1,62 @@
+---
+title: "NEAT1 transcript expression"
+author: "Katharina Hembach"
+date: "3/24/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r library}
+library(here)
+library(ggplot2)
+library(dplyr)
+library(SingleCellExperiment)
+```
+
+We import the salmon quantifications and filter the NEAT1 transcripts.
+```{r filter-neat}
+se <- readRDS(here("output_riboZero", "outputR", "tximeta_se.rds"))
+## transcript level estimates
+st <- se$st
+metadata <- colData(st)
+st 
+## counts are estimated counts
+## abundnace are TPM (transcripts per million)
+## length are effective transcript lengths
+
+neat_id <- which(rowData(st)$gene_name == "NEAT1")
+## all NEAT1 transcripts
+neat <- assay(st, "counts")[neat_id,]
+# all transcript with abundnace > 0
+neat <- neat[rowSums(neat) > 0,]
+```
+
+We define the longest transcript and group all the shorter transcripts.
+```{r define-lengt} 
+assay(st, "length")[neat_id,]
+## long transcript
+long <- neat["ENST00000501122",]
+long
+short <- neat[-(rownames(neat) == "ENST00000501122"),]
+short
+## we sum up all shorter transcripts
+short <- colSums(short)
+```
+
+We plot the TPM values of the long and short transcripts.
+```{r plot}
+df <- data.frame(transcript = c(rep("long", length(long)),
+                                rep("short", length(short))),
+                 TPM = c(long, short),
+                 sample = c(colData(st)$group, colData(st)$group))
+df %>% head
+
+ggplot(df, aes(x = sample, y = TPM, color = transcript)) + 
+  geom_jitter() + 
+  theme_bw() + theme(text = element_text(size=14)) 
+```
+

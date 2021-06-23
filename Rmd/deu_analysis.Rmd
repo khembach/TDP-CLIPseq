@@ -1,0 +1,250 @@
+---
+title: "Differential exon usage results"
+author: "Katharina Hembach"
+date: "3/3/2021"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")))
+```
+
+### Load packages
+```{r, message = FALSE}
+library(here)
+library(stringr)
+library(rtracklayer)
+library(ggplot2)
+library(dplyr)
+```
+
+
+# Load data 
+
+```{r load-res}
+deu_files <- list(WT6M = here("DEU", "new.WTvs6M.padjLimit0.01.results.txt"),
+            WTRBDm = here("DEU", "new.WTvsRBDM.padjLimit0.01.results.txt"),
+            x6MRBDm = here("DEU", "new.x6mvsRBDM.padjLimit0.01.results.txt"))
+deu <- lapply(deu_files, read.table,  header=TRUE, sep = "\t")
+deu[["WT6M"]] %>% head
+```
+
+
+Load the bigwig files
+```{r load-bw}
+bw_files <- list.files(here("bigwig_Uli"), pattern = ".bw", full.names = TRUE)
+names(bw_files) <- str_split(basename(bw_files), pattern = ".Aligned", 
+                             simplify = TRUE)[,1]
+#import bigwig file into R to compute max coverage in a genomic region
+bw <- lapply(bw_files, import)
+bw[[1]]
+```
+
+
+# Compute max read coverage per exon
+
+We compute the maximal coverage height for all exons in the list and we compute the mean of the four replicates.
+
+```{r max-cov-height}
+comp <- "WT6M"
+gr <- GRanges(deu[[comp]]$genomicData.seqnames, 
+              IRanges(deu[[comp]]$genomicData.start, deu[[comp]]$genomicData.end),
+              strand = ifelse(deu[[comp]]$genomicData.strand == "0", "*", 
+                              deu[[comp]]$genomicData.strand))
+bw_index <- which(startsWith(names(bw_files), "WT") |  startsWith(names(bw_files), "6M"))
+for (i in bw_index) {
+    olap <- findOverlaps(gr, bw[[i]])
+    bw_split <- split(bw[[i]][subjectHits(olap)], queryHits(olap))
+    ## get max # or reads in exon
+    max_height <- sapply(bw_split, function(x) max(x$score))
+    deu[[comp]][,paste0("max_cov_", names(bw)[i])] <- max_height
+}
+## add mean of replicates
+deu[[comp]][,"mean_6M"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_6M")) %>% rowMeans
+deu[[comp]][,"mean_WT"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_WT")) %>% rowMeans
+head(deu[[comp]])
+
+comp <- "WTRBDm"
+gr <- GRanges(deu[[comp]]$genomicData.seqnames, 
+              IRanges(deu[[comp]]$genomicData.start, deu[[comp]]$genomicData.end),
+              strand = ifelse(deu[[comp]]$genomicData.strand == "0", "*", 
+                              deu[[comp]]$genomicData.strand))
+bw_index <- which(startsWith(names(bw_files), "WT") |  startsWith(names(bw_files), "RBDM"))
+for (i in bw_index) {
+    olap <- findOverlaps(gr, bw[[i]])
+    bw_split <- split(bw[[i]][subjectHits(olap)], queryHits(olap))
+    max_height <- sapply(bw_split, function(x) max(x$score))
+    deu[[comp]][,paste0("max_cov_", names(bw)[i])] <- max_height
+}
+## add mean of replicates
+deu[[comp]][,"mean_RBDm"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_RBDm")) %>% rowMeans
+deu[[comp]][,"mean_WT"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_WT")) %>% rowMeans
+head(deu[[comp]])
+
+comp <- "x6MRBDm"
+gr <- GRanges(deu[[comp]]$genomicData.seqnames, 
+              IRanges(deu[[comp]]$genomicData.start, deu[[comp]]$genomicData.end),
+              strand = ifelse(deu[[comp]]$genomicData.strand == "0", "*", 
+                              deu[[comp]]$genomicData.strand))
+bw_index <- which(startsWith(names(bw_files), "6M") |  startsWith(names(bw_files), "RBDM"))
+for (i in bw_index) {
+    olap <- findOverlaps(gr, bw[[i]])
+    bw_split <- split(bw[[i]][subjectHits(olap)], queryHits(olap))
+    max_height <- sapply(bw_split, function(x) max(x$score))
+    deu[[comp]][,paste0("max_cov_", names(bw)[i])] <- max_height
+}
+## add mean of replicates
+deu[[comp]][,"mean_6M"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_6M")) %>% rowMeans
+deu[[comp]][,"mean_RBDm"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_RBDm")) %>% rowMeans
+head(deu[[comp]])
+```
+
+# Plot mean max coverage height of the two groups and color by adjusted p-value
+```{r}
+ggplot(deu[["WT6M"]], aes(x = mean_6M, y = mean_WT, color = padj)) + 
+  geom_point(alpha = 0.5) + theme_bw() + 
+  geom_abline(intercept = 0, color = "blue") + 
+  scale_y_log10() + scale_x_log10()
+
+ggplot(deu[["WTRBDm"]], aes(x = mean_RBDm, y = mean_WT, color = padj)) + 
+  geom_point(alpha = 0.5) + theme_bw() + 
+  geom_abline(intercept = 0, color = "blue") +
+  scale_y_log10() + scale_x_log10()
+
+ggplot(deu[["x6MRBDm"]], aes(x = mean_6M, y = mean_RBDm, color = padj)) + 
+  geom_point(alpha = 0.5) + theme_bw() + 
+  geom_abline(intercept = 0, color = "blue") + 
+  scale_y_log10() + scale_x_log10()
+```
+
+# Save result tables
+```{r save-tables}
+for (i in names(deu)) {
+  write.table(deu[[i]], here("DEU", paste0(str_sub(basename(deu_files[[i]]), 
+                                   start = 1L, end = -4), "max_cov.txt")),
+                             sep = "\t", row.name = FALSE, quote = FALSE)
+}
+```
+
+
+# Compare filtered events with CLIP peaks
+
+Manu filtered the DEXSeq results based on the number of reads per event (>20), the read count per base (> 0.025) and the log2FC (absolute value >1.75). All events that fulfill at least one of the requirements are kept, the rest is labelled.
+```{r }
+deu_files <- list(WT6M = here("DEU", "SplicingAnalysis_6MvsWT_filtered.csv"),
+            WTRBDm = here("DEU", "SplicingAnalysis_RBDmvsWT_filtered.csv"))
+deu <- lapply(deu_files, fread)
+lapply(deu, nrow)
+lapply(deu, function(x) table(x$Filter))
+
+peaks <- list("WT" = import(here("IDR_merge_peaks", "merge_peaks_2inputs_WT", "results", "WT.vs.WT2.bed")), 
+           "6M" = import(here("IDR_merge_peaks", "merge_peaks_2inputs_6M", "results", "6M.vs.6M2.bed")), 
+           "RBDm" = import(here("IDR_merge_peaks", "merge_peaks_2inputs_RBDm", "results", "RBDm.vs.RBDm2.bed")))
+lengths(peaks)
+gdf <- fread(here("analysis", "clipper_analysis", "gene_cluster_count_merge_peaks.txt"))
+```
+
+How many events overlap with a peak?
+
+```{r overlap-event-peaks}
+gr <- lapply(deu, function(d) makeGRangesFromDataFrame(d,
+                         keep.extra.columns=TRUE,
+                         ignore.strand=TRUE,
+                         seqinfo=NULL,
+                         seqnames.field="genomicData.seqnames",
+                         start.field="genomicData.start",
+                         end.field="genomicData.end",
+                         strand.field="genomicData.strand",
+                         starts.in.df.are.0based=FALSE))
+gr <- lapply(gr, function(g) {
+  seqlevelsStyle(g) <- "UCSC"
+  g})
+## overlap with WT peaks
+olap <- findOverlaps(gr[["WT6M"]], peaks[["WT"]])
+# number of events
+unique(queryHits(olap)) %>% length
+# number of peaks
+unique(subjectHits(olap)) %>% length
+# how many of these events were filtered out?
+gr[["WT6M"]][unique(queryHits(olap))]$Filter %>% table
+## overlap with 6M peaks
+olap <- findOverlaps(gr[["WT6M"]], peaks[["6M"]])
+unique(queryHits(olap)) %>% length
+unique(subjectHits(olap)) %>% length
+gr[["WT6M"]][unique(queryHits(olap))]$Filter %>% table
+
+
+# How close/far is the nearest CLIP peak to each event?
+near <- nearest(gr[["WT6M"]], peaks[["WT"]])
+## what is the distance?
+dist_wt <- distanceToNearest(gr[["WT6M"]], peaks[["WT"]])
+mcols(dist_wt)$distance %>% summary
+dist_6M <- distanceToNearest(gr[["WT6M"]], peaks[["6M"]])
+mcols(dist_6M)$distance %>% summary
+
+## distribution of distance stratified by Filter and peak in WT / 6M
+df <- data.frame(distance_WT = mcols(dist_wt)$distance, 
+                 distance_6M = mcols(dist_6M)$distance,
+                 filter = gr[["WT6M"]]$Filter)
+df_long <- gather(df, sample, distance, distance_WT, distance_6M, factor_key = TRUE)
+
+p <- ggplot(df_long, aes(x = sample, y = distance + 1, color = sample)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.3)  +
+  scale_y_continuous(trans='log10') +
+  facet_grid(~filter)
+p
+## how exactly is the distance computed?
+
+
+## overlap with WT peaks
+olap <- findOverlaps(gr[["WTRBDm"]], peaks[["WT"]])
+# number of events
+unique(queryHits(olap)) %>% length
+# number of peaks
+unique(subjectHits(olap)) %>% length
+# how many of these events were filtered out?
+gr[["WTRBDm"]][unique(queryHits(olap))]$Filter %>% table
+## overlap with RBDm peaks
+olap <- findOverlaps(gr[["WTRBDm"]], peaks[["RBDm"]])
+unique(queryHits(olap)) %>% length
+unique(subjectHits(olap)) %>% length
+gr[["WTRBDm"]][unique(queryHits(olap))]$Filter %>% table
+
+# How close/far is the nearest CLIP peak to each event?
+near <- nearest(gr[["WTRBDm"]], peaks[["WT"]])
+## what is the distance?
+dist_wt <- distanceToNearest(gr[["WTRBDm"]], peaks[["WT"]])
+mcols(dist_wt)$distance %>% summary
+dist_RBDm <- distanceToNearest(gr[["WTRBDm"]], peaks[["RBDm"]])
+mcols(dist_RBDm)$distance %>% summary
+
+## distribution of distance stratified by Filter and peak in WT / RBDm
+df <- data.frame(distance_WT = mcols(dist_wt)$distance, 
+                 distance_RBDm = mcols(dist_RBDm)$distance,
+                 filter = gr[["WTRBDm"]]$Filter)
+df_long <- gather(df, sample, distance, distance_WT, distance_RBDm, factor_key = TRUE)
+
+p <- ggplot(df_long, aes(x = sample, y = distance + 1, color = sample)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.3)  +
+  scale_y_continuous(trans='log10') +
+  facet_grid(~filter)
+p
+
+```
+
+
+
+```{r sessionInfo}
+sessionInfo()
+```

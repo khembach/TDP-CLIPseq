@@ -1,0 +1,171 @@
+---
+title: "Update Ensembl with snoDB annotations"
+author: "Katharina Hembach"
+date: "4/26/2021"
+output: 
+  html_document:
+  toc: true
+toc_float: true
+---
+  
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")))
+```
+
+
+### Load packages
+```{r, message = FALSE}
+library(here)
+library(rtracklayer)
+library(data.table)
+library(dplyr)
+```
+
+# Load data
+
+```{r load-data}
+gtf_file <- here("reference", "Homo_sapiens.GRCh38.98.sorted.gtf")
+gtf <- import(gtf_file)
+genes <- gtf[gtf$type == "gene"]
+
+sno <- fread(here("snoDB", "snoDB.tsv"))
+dim(sno)
+sno[1,]
+```
+
+# Compare Ensembl to snoDB
+
+We compare the two databases to find out how many snoRNAs are missing in Ensembl
+
+```{r compare-databases, warning = FALSE}
+table(sno$Ensembl == "") ## there are many missing in Ensembl
+## How many are really in our annotations?
+sno$Ensembl %in% gtf$gene_id %>% table
+
+sno_gr <- GRanges(sno)
+sno_gr_an <- subsetByOverlaps(sno_gr, genes, type = "equal", ignore.strand = FALSE)
+sno_gr_an[which(!sno_gr_an$Ensembl %in% gtf$gene_id)][1]
+
+## what are the biotypes of the genes that have equal coordinates as the snoDB entries?
+gtf_sno <- subsetByOverlaps(genes, sno_gr, type = "equal", ignore.strand = FALSE)
+length(gtf_sno)
+gtf_sno$gene_biotype %>% table
+
+gtf_sno[gtf_sno$gene_biotype == "lncRNA"]
+```
+
+# List of missing snoDB annotations
+
+We generate a list of unique and non-verlapping snoDB entries that are missing from Ensembl.
+```{r missing, warning = FALSE}
+sno_missing <- subsetByOverlaps(sno_gr, genes, type = "equal", 
+                                ignore.strand = FALSE, invert = TRUE)
+seqnames(sno_missing) %>% table
+
+## only keep RNAs where there is no gene with the same name annotated in Ensembl
+sno_missing$Symbol %in% genes$gene_name %>% table
+dups <- sno_missing[sno_missing$Symbol %in% genes$gene_name]
+## are the Ensembl genes overlapping with the snoDB genes?
+dups_ens <- genes[genes$gene_name %in% dups$Symbol]
+
+sp <- split(dups, dups$Symbol)
+sp_ens <- split(dups_ens, dups_ens$gene_name)
+
+## keep the genes that are not overlapping with an Ensembl gene with the same name
+no_dups <- lapply(names(sp), function(x) {
+    subsetByOverlaps(sp[[x]], sp_ens[[x]], type = "any", 
+                     ignore.strand = FALSE, invert = TRUE)
+})
+no_dups <- unlist(GRangesList(no_dups))
+sno_missing <- c(no_dups,  sno_missing[!sno_missing$Symbol %in% genes$gene_name])
+sno_missing %>% length
+
+## some snoRNAs have multiple entries with the same name
+## --> merge duplicate snoRNAs that only vary in a few bps
+sp <- split(sno_missing, sno_missing$Symbol)
+uni <- names(sp)[lengths(sp) == 1]
+sp <- sp[lengths(sp) > 1]
+
+merged <- lapply(sp, function(x) {
+  old <- x
+  x <- reduce(x)
+  if(length(x) == length(old)) { ## no ranges were reduced
+    return(old)
+  }
+  ## reduction removed metadata, we need to add gene name and ID
+  x$Symbol <- old$Symbol[1]
+  x$id <- paste0("reduced_nr_", 1:length(x), "_",  x$Symbol)
+  x
+})
+merged <- unlist(GRangesList(merged))
+names(merged) <- NULL
+
+## unique and merged snoRNAs that are missing from Ensembl
+sno_missing <- c(sno_missing[sno_missing$Symbol %in% uni], merged)
+length(sno_missing)
+
+## check for overlapping snoRNAs with different names but nearly identical location
+olaps <- countOverlaps(sno_missing, sno_missing, ignore.strand = FALSE)
+uniq <- sno_missing[olaps == 1]
+dups <- sno_missing[olaps > 1]
+
+## pairs of overlapping snoRNAs that need to be merged
+dup_olap <- findOverlaps(dups, dups, ignore.strand = FALSE)
+res <- list()
+ind <- unique(queryHits(dup_olap))
+while (length(ind) > 0) {
+  i <-  ind[1]
+  res[[length(res)+1]] <- subjectHits(dup_olap)[queryHits(dup_olap) == i] 
+  ind <- ind[!ind %in% res[[length(res)]]]
+}
+
+## merge overlapping annotations
+dups_merged <- lapply(res, function(x) {
+  d <- dups[x]
+  a <- reduce(d)
+  a$Symbol <- paste(d$Symbol, collapse = "_")
+  a$id <- paste(d$id, collapse = "_")
+  a
+})
+dups_merged <- unlist(GRangesList(dups_merged))
+
+sno_missing <- c(uniq, dups_merged)
+length(sno_missing)
+
+## we generate a gene, transcript and exon entry for the missing snoRNAs
+new <- granges(sno_missing)
+## we add the metadata
+colnames(mcols(gtf)) 
+new$source <- "snoDB"
+new$type <- "gene"
+new$gene_id <- paste0("snoDB", sno_missing$id)
+new$gene_name <- sno_missing$Symbol
+new$gene_biotype <- "snoRNA"
+
+new_tr <- new
+new_tr$type <- "transcript"
+new_tr$transcript_id <- paste0(new$gene_id, "_1")
+
+new_ex <- new
+new_ex$type <- "exon"
+new_ex$exon_number <- "1"
+
+new <- c(new, new_tr, new_ex)
+new <- new[order(new$gene_id)]
+
+export(new, here("reference", "snoDB.gtf"))
+```
+
+# Add the new snoRNAs to the Ensembl annotation
+We add all missing snoDB entries to our Ensembl annotation.
+
+```{r export-Ensembl}
+gtf_snoDB <- c(gtf, new)
+export(gtf_snoDB, here("reference", "Homo_sapiens.GRCh38.98_snoDB.gtf"))
+```
+
+```{r}
+sessionInfo()
+```
+

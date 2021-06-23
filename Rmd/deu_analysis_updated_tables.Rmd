@@ -1,0 +1,158 @@
+---
+title: "Differential exon usage results"
+author: "Katharina Hembach"
+date: "18.06.2021"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")))
+```
+
+### Load packages
+```{r, message = FALSE}
+library(here)
+library(stringr)
+library(rtracklayer)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+```
+
+
+# Load data 
+
+```{r load-res}
+deu_files <- list(WT6M = here("DEU", "tables_June", "WTvs6M.results.GS.txt"),
+            WTRBDm = here("DEU", "tables_June", "WTvsRBDM.results.GS.txt"),
+            x6MRBDm = here("DEU", "tables_June", "x6mvsRBDM.results.GS.txt"))
+fix_file <- function(file){
+  a <- readLines(file)
+  ## identify lines starting with " or )
+  ## add them to end of previous line and remove the problematic line
+  ind <- grep("^[\"|)]", a) ## identify wrong lines
+  # ind2 <- grep("^\"", a)
+  a[ind-1] <- paste0(a[ind-1], a[ind])
+  a <- a[-ind]
+  ## write to file or use as input to freadz
+  file_base <- tools::file_path_sans_ext(basename(file))
+  writeLines(a, here("DEU", "tables_June", paste0(file_base, ".fixed.txt")))
+}
+lapply(deu_files, fix_file)
+deu_files <- lapply(deu_files, function(x) {
+  file_base <- tools::file_path_sans_ext(x)
+  paste0(file_base, ".fixed.txt")})
+
+deu <- lapply(deu_files, fread, fill = TRUE, sep = "\t", header = TRUE)
+deu[["WT6M"]] %>% head
+```
+
+
+Load the bigwig files
+```{r load-bw}
+bw_files <- list.files(here("bigwig_Uli"), pattern = ".bw", full.names = TRUE)
+names(bw_files) <- str_split(basename(bw_files), pattern = ".Aligned", 
+                             simplify = TRUE)[,1]
+#import bigwig file into R to compute max coverage in a genomic region
+bw <- lapply(bw_files, import)
+bw[[1]]
+```
+
+
+# Compute max read coverage per exon
+
+We compute the maximal coverage height for all exons in the list and we compute the mean of the four replicates.
+
+```{r max-cov-height}
+comp <- "WT6M"
+gr <- GRanges(deu[[comp]]$genomicData.seqnames, 
+              IRanges(deu[[comp]]$genomicData.start, deu[[comp]]$genomicData.end),
+              strand = ifelse(deu[[comp]]$genomicData.strand == "0", "*", 
+                              deu[[comp]]$genomicData.strand))
+bw_index <- which(startsWith(names(bw_files), "WT") |  startsWith(names(bw_files), "6M"))
+for (i in bw_index) {
+    olap <- findOverlaps(gr, bw[[i]])
+    bw_split <- split(bw[[i]][subjectHits(olap)], queryHits(olap))
+    ## get max # of reads in exon
+    max_height <- sapply(bw_split, function(x) max(x$score))
+    deu[[comp]][,paste0("max_cov_", names(bw)[i])] <- max_height
+}
+## add mean of replicates
+deu[[comp]][,"mean_6M"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_6M")) %>% rowMeans
+deu[[comp]][,"mean_WT"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_WT")) %>% rowMeans
+head(deu[[comp]])
+
+comp <- "WTRBDm"
+gr <- GRanges(deu[[comp]]$genomicData.seqnames, 
+              IRanges(deu[[comp]]$genomicData.start, deu[[comp]]$genomicData.end),
+              strand = ifelse(deu[[comp]]$genomicData.strand == "0", "*", 
+                              deu[[comp]]$genomicData.strand))
+bw_index <- which(startsWith(names(bw_files), "WT") |  startsWith(names(bw_files), "RBDM"))
+for (i in bw_index) {
+    olap <- findOverlaps(gr, bw[[i]])
+    bw_split <- split(bw[[i]][subjectHits(olap)], queryHits(olap))
+    max_height <- sapply(bw_split, function(x) max(x$score))
+    deu[[comp]][,paste0("max_cov_", names(bw)[i])] <- max_height
+}
+## add mean of replicates
+deu[[comp]][,"mean_RBDm"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_RBDm")) %>% rowMeans
+deu[[comp]][,"mean_WT"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_WT")) %>% rowMeans
+head(deu[[comp]])
+
+comp <- "x6MRBDm"
+gr <- GRanges(deu[[comp]]$genomicData.seqnames, 
+              IRanges(deu[[comp]]$genomicData.start, deu[[comp]]$genomicData.end),
+              strand = ifelse(deu[[comp]]$genomicData.strand == "0", "*", 
+                              deu[[comp]]$genomicData.strand))
+bw_index <- which(startsWith(names(bw_files), "6M") |  startsWith(names(bw_files), "RBDM"))
+for (i in bw_index) {
+    olap <- findOverlaps(gr, bw[[i]])
+    bw_split <- split(bw[[i]][subjectHits(olap)], queryHits(olap))
+    max_height <- sapply(bw_split, function(x) max(x$score))
+    deu[[comp]][,paste0("max_cov_", names(bw)[i])] <- max_height
+}
+## add mean of replicates
+deu[[comp]][,"mean_6M"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_6M")) %>% rowMeans
+deu[[comp]][,"mean_RBDm"] <- deu[[comp]] %>% 
+  dplyr::select(starts_with("max_cov_RBDm")) %>% rowMeans
+head(deu[[comp]])
+```
+
+# Plot mean max coverage height of the two groups and color by adjusted p-value
+```{r}
+ggplot(deu[["WT6M"]], aes(x = mean_6M, y = mean_WT, color = padj)) + 
+  geom_point(alpha = 0.5) + theme_bw() + 
+  geom_abline(intercept = 0, color = "blue") + 
+  scale_y_log10() + scale_x_log10()
+
+ggplot(deu[["WTRBDm"]], aes(x = mean_RBDm, y = mean_WT, color = padj)) + 
+  geom_point(alpha = 0.5) + theme_bw() + 
+  geom_abline(intercept = 0, color = "blue") +
+  scale_y_log10() + scale_x_log10()
+
+ggplot(deu[["x6MRBDm"]], aes(x = mean_6M, y = mean_RBDm, color = padj)) + 
+  geom_point(alpha = 0.5) + theme_bw() + 
+  geom_abline(intercept = 0, color = "blue") + 
+  scale_y_log10() + scale_x_log10()
+```
+
+# Save result tables
+```{r save-tables}
+for (i in names(deu)) {
+  write.table(deu[[i]], here("DEU", paste0(str_sub(basename(deu_files[[i]]), 
+                                   start = 1L, end = -4), "max_cov.txt")),
+                             sep = "\t", row.name = FALSE, quote = FALSE)
+}
+```
+
+```{r sessionInfo}
+sessionInfo()
+```

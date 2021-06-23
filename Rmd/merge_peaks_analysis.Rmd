@@ -1,0 +1,1334 @@
+---
+title: "merge_peaks results analysis"
+author: "Katharina Hembach"
+date: "2/26/2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")))
+```
+
+### Load packages
+```{r, message = FALSE}
+library(here)
+library(stringr)
+library(rtracklayer)
+library(data.table)
+library(ggplot2)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(dplyr)
+library(GenomicAlignments)
+library(eulerr)
+library(ComplexHeatmap)
+library(VennDiagram)
+library(ggpubr)
+library(Biostrings)
+library(ggrepel)
+library(biomaRt)
+```
+
+# Data import
+
+We import the merge_peaks results.
+```{r import-mp}
+mp <- list("WT" = import(here("IDR_merge_peaks", "merge_peaks_2inputs_WT", "results", "WT.vs.WT2.bed")), 
+           "6M" = import(here("IDR_merge_peaks", "merge_peaks_2inputs_6M", "results", "6M.vs.6M2.bed")), 
+           "RBDm" = import(here("IDR_merge_peaks", "merge_peaks_2inputs_RBDm", "results", "RBDm.vs.RBDm2.bed")))
+lengths(mp)
+```
+
+
+We import the clusters from our filtering pipeline (clipper_analysis.Rmd) based on read coverage and requiring > 20% peak height of WT samples in 6M ad RBDm.
+
+```{r import-my-BED}
+## BED files
+my <- list("WT" = import(here("analysis", "BED", "min10_groupNorm",
+                  "WT_clipper_score0.01_clusters_5nt_min10_groupNorm_merged.bed")),
+           "6M" = import(here("analysis", "BED", "min10_groupNorm", 
+                              "6M_clipper_score0.01_clusters_5nt_min10_groupNorm_20perc_WT.bed")),
+           "RBDm" = import(here("analysis", "BED", "min10_groupNorm", 
+                                "RBDm_clipper_score0.01_clusters_5nt_min10_groupNorm_20perc_WT.bed")))
+lengths(my)
+```
+
+We import the table with the number of clusters per gene.
+```{r import-my-gdf}
+## import gdf
+gdf_my <- readRDS(here("Rmd", "rds", "gdf.rds"))
+head(gdf_my)
+```
+
+# Peak quality control
+Peak height in both replicates
+```{r peak-height-distribution}
+cov <- readRDS(here("Rmd", "rds", "BAM_coverage.rds"))
+## maximal peak coverage
+n <- names(mp)
+mp <- lapply(names(mp), function(x) {
+  p <- mp[[x]]
+  mcols(p)[paste0("max_cov_", x)]<- max(cov[[x]][p])
+  mcols(p)[paste0("max_cov_", x, "2")] <- max(cov[[paste0(x, "2")]][p])
+  p})
+names(mp) <- n
+
+## max peak height in replicate 1
+lapply(mp, function(x) summary(mcols(x)[,3]))
+## max peak height in replicate 2
+lapply(mp, function(x) summary(mcols(x)[,4]))
+
+## Plot the distribution of max peak coverage in each sample
+df <- data.frame(sample = c(rep("WT", length(mp[["WT"]])),
+                            rep("WT2", length(mp[["WT"]])),
+                            rep("6M", length(mp[["6M"]])),
+                            rep("6M2", length(mp[["6M"]])),
+                            rep("RBDm", length(mp[["RBDm"]])),
+                            rep("RBDm2", length(mp[["RBDm"]]))),
+                 max_cov = c(mp[["WT"]]$max_cov_WT, mp[["WT"]]$max_cov_WT2,
+                             mp[["6M"]]$max_cov_6M, mp[["6M"]]$max_cov_6M2,
+                             mp[["RBDm"]]$max_cov_RBDm, mp[["RBDm"]]$max_cov_RBDm2))
+
+p <- ggplot(df, aes(x = sample, y = max_cov)) + 
+  geom_violin() + 
+  geom_boxplot(width=0.1) + 
+  scale_y_log10()+ 
+  theme_bw()
+p
+
+
+## comparison of the max peak height in both replicates
+## WT
+p <- ggplot(mcols(mp[["WT"]]) %>% as.data.frame(), 
+            aes(x = max_cov_WT, y = max_cov_WT2)) + 
+  geom_point(alpha = 0.3) + 
+  theme_bw() + geom_abline(intercept = 0, color = "blue") +
+  scale_y_log10() + scale_x_log10()
+p
+## 6M
+p <- ggplot(mcols(mp[["6M"]]) %>% as.data.frame(), 
+            aes(x = max_cov_6M, y = max_cov_6M2)) + 
+  geom_point(alpha = 0.3) + 
+  theme_bw() + geom_abline(intercept = 0, color = "blue") +
+  scale_y_log10() + scale_x_log10()
+p
+## RBDm
+p <- ggplot(mcols(mp[["RBDm"]]) %>% as.data.frame(), 
+            aes(x = max_cov_RBDm, y = max_cov_RBDm2)) + 
+  geom_point(alpha = 0.3) + 
+  theme_bw() + geom_abline(intercept = 0, color = "blue") +
+  scale_y_log10() + scale_x_log10()
+p
+
+## distribution of peak lengths
+dfl <- data.frame(sample = c(rep("WT", length(mp[["WT"]])),
+                             rep("6M", length(mp[["6M"]])),
+                             rep("RBDm", length(mp[["RBDm"]]))),
+                  peak_length = c(width(mp[["WT"]]), width(mp[["6M"]]), 
+                                  width(mp[["RBDm"]])))
+p <- ggplot(dfl, aes(x = sample, y = peak_length)) + 
+  geom_violin() + 
+  geom_boxplot(width=0.1) + 
+  scale_y_log10()+ 
+  theme_bw()
+p
+
+## How many peaks are shorter than 10 bp?
+## number of peaks with at least 10 reads in both replicates
+lengths(mp)
+lengths(lapply(mp, function(x) x[(mcols(x)[,3] > 10 & mcols(x)[,4] > 10),]))
+
+## How many peaks are touching a neighboring peak?
+mp_merge <- lapply(mp, function(x) GenomicRanges::union(x, x))
+lengths(mp_merge)
+
+## all the original peaks are still in the merged list
+subsetByOverlaps(mp[[1]], GenomicRanges::union(mp[[1]], mp[[1]]), type = "within")
+
+## distribution of peak length after merging
+data.frame(sample = c(rep("WT", length(mp_merge[["WT"]])),
+                             rep("6M", length(mp_merge[["6M"]])),
+                             rep("RBDm", length(mp_merge[["RBDm"]]))),
+                  peak_length = c(width(mp_merge[["WT"]]), 
+                                  width(mp_merge[["6M"]]), 
+                                  width(mp_merge[["RBDm"]]))) %>%
+  ggplot(aes(x = sample, y = peak_length)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.1) + 
+  scale_y_log10()+ 
+  theme_bw()
+
+## number of peaks with at least 10 reads in both replicates after merging
+lengths(mp_merge)
+n <- names(mp_merge)
+mp_merge <- lapply(names(mp_merge), function(x) {
+  p <- mp_merge[[x]]
+  mcols(p)[paste0("max_cov_", x)]<- max(cov[[x]][p])
+  mcols(p)[paste0("max_cov_", x, "2")] <- max(cov[[paste0(x, "2")]][p])
+  p})
+names(mp_merge) <- n
+lengths(lapply(mp_merge, function(x) x[(mcols(x)[,1] > 10 & mcols(x)[,2] > 10),]))
+
+## Distribution of peak length before and after merging
+lapply(mp, function(x) summary(width(x)))
+lapply(mp_merge, function(x) summary(width(x)))
+## How many peaks are shorter than 20 bp before and after merging?
+lapply(mp, function(x) table(width(x) < 20))
+lapply(mp_merge, function(x) table(width(x) < 20))
+```
+
+
+# Gene table
+
+```{r gdf-preprocessing}
+source(here("scripts", "data_import.R"))
+gtf_file <- here("reference", "Homo_sapiens.GRCh38.98.sorted.gtf")
+gtf <- import(gtf_file)
+anno <- prepare_anno(gtf)
+anno <- lapply(anno, function(x) {seqlevelsStyle(x) <- "UCSC"; x})
+anno <- GRangesList(anno)
+## annotate each cluster with a gene
+genes <- anno[["gene"]]
+
+## prepare peak lists and annotations to generate gene table
+cov_combined <- readRDS(here("Rmd", "rds", "cov_combined.rds"))
+## add peak height (sum of both replicates)
+for (x in names(mp)) {
+  mp[[x]]$merged_max_cov <- max(cov_combined[[x]][mp[[x]]])
+}
+```
+
+Comparison with the WT clusters.
+
+```{r compare-WT-perc}
+n6m <- length(mp[["6M"]])
+nRBDm <- length(mp[["RBDm"]])
+nWT <- length(mp[["WT"]])
+
+peaks_filtered <- list()
+## all peaks that do not overlap with a peak in WT
+peaks_filtered[["6M"]] <- subsetByOverlaps(mp[["6M"]], 
+                                           mp[["WT"]], invert = TRUE)
+peaks_filtered[["RBDm"]] <- subsetByOverlaps(mp[["RBDm"]], 
+                                           mp[["WT"]], invert = TRUE)
+lengths(peaks_filtered)
+
+## peaks overlapping with WT, or for WT all peaks overlapping with either 6M or RBDm
+peaks_both <- list()
+## all peaks that do not overlap with a peak in WT
+peaks_both[["6M"]] <- subsetByOverlaps(mp[["6M"]], 
+                                           mp[["WT"]])
+peaks_both[["RBDm"]] <- subsetByOverlaps(mp[["RBDm"]], 
+                                           mp[["WT"]])
+peaks_both[["WT"]] <- subsetByOverlaps(mp[["WT"]], 
+                                           c(mp[["6M"]], 
+                                             mp[["RBDm"]]))
+lengths(peaks_both)
+```
+
+Construct gene table.
+
+```{r gdf}
+## data.frame with all human genes
+gdf <- as.data.frame(genes) %>% 
+  dplyr::select(seqnames, start, end, strand, gene_id, gene_name, gene_biotype)
+  
+for(i in c("6M", "RBDm", "WT")){
+  gdf[,paste0("nclus_", i)] <- countOverlaps(genes, mp[[i]])
+  ## mean merged peak height per gene
+  olaps <- findOverlaps(genes, mp[[i]])
+  gid <- queryHits(olaps)
+  clus_per_gene <- split(mp[[i]][subjectHits(olaps)], gid)
+  mean_per_gene <- lapply(clus_per_gene, function(x) mean(x$merged_max_cov))
+  gdf[, paste0("mean_max_cov_", i)] <- 0
+  gdf[names(mean_per_gene), paste0("mean_max_cov_", i)] <- unlist(mean_per_gene)
+}
+
+for(i in c("6M", "RBDm")) {
+  gdf[,paste0("nclus_", i, "_only")] <- countOverlaps(genes, peaks_filtered[[i]])
+}
+
+for(i in c("6M", "RBDm")) {
+  gdf[,paste0("nclus_", i, "_inWT")] <- countOverlaps(genes, peaks_both[[i]])
+}
+
+gdf$nclus_max <- pmax(gdf$nclus_6M, gdf$nclus_RBDm, gdf$nclus_WT)
+## remove all genes with 0 peaks
+gdf <- gdf %>% dplyr::filter(nclus_max > 0)
+gdf <- gdf %>% dplyr::arrange(desc(nclus_max))
+gdf %>% dplyr::arrange(desc(nclus_6M)) %>% head
+gdf %>% dplyr::arrange(desc(nclus_RBDm)) %>% head
+gdf %>% dplyr::arrange(desc(nclus_WT)) %>% head
+gdf %>% dplyr::arrange(desc(nclus_6M_only)) %>% head
+gdf %>% dplyr::arrange(desc(nclus_RBDm_only)) %>% head
+
+## distribution of gene types
+gdf$gene_biotype %>% table
+## we remove pseudogenes
+gdf <- gdf %>% dplyr::filter(!gene_biotype %in% 
+    c("processed_pseudogene", "rRNA_pseudogene", 
+      "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene", 
+      "transcribed_unprocessed_pseudogene", "unprocessed_pseudogene", "TEC"))
+gdf$gene_biotype %>% table
+
+## genes with 6M clusters but 0 WT cluster
+gdf %>% dplyr::arrange(desc(nclus_6M_only)) %>% 
+  dplyr::filter(nclus_WT == 0) %>% 
+  head
+
+## bound in WT and RBDm, but not 6M
+gdf %>% dplyr::filter(nclus_6M == 0 & nclus_WT > 0 & nclus_RBDm > 0) %>% 
+  head
+
+write.table(gdf, here("analysis", "clipper_analysis", "gene_cluster_count_merge_peaks.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+
+## Comparison with RNA-seq data
+
+Is the number of clusters of the mean peak height per gene correlated with the RNA-seq gene expression? I.e. do highly expressed genes have more or higher clusters? 
+Is the number/height of clusters correlated with the gene length?
+```{r ncluster-RNAseq-expression-comparison, warning = FALSE, message = FALSE}
+rna <- here("analysis", "RNAseq", "TDP-43_all-samples_norm-counts.xlsx")
+rna <- read_excel(rna, col_names = TRUE)
+rna <- rna %>% dplyr::mutate(sum_wt = rowSums(rna %>% dplyr::select(starts_with("WT"))),
+                             sum_6M = rowSums(rna %>% dplyr::select(starts_with("6M"))),
+                             sum_RBDm = rowSums(rna %>% dplyr::select(starts_with("RBDm")))) 
+gdf_rna <- gdf %>% left_join(rna, by = c("gene_id" = "Gene")) 
+gdf_rna$gene_length <- lengths(anno[["gene"]][
+  match(gdf_rna$gene_id, anno[["gene"]]$gene_id)
+  ])
+
+## WT
+gdf_rna_part <- gdf_rna %>% dplyr::filter(nclus_WT > 0)
+WT_mean <- gdf_rna_part %>% dplyr::select(WT1, WT2, WT3, WT4) %>% rowMeans()
+p <- ggplot(gdf_rna_part, aes(x = WT_mean, y = nclus_WT)) + 
+  geom_point(alpha = 0.3)  +
+  stat_cor(method = "pearson") +
+  geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
+  scale_x_log10()
+p
+p <- ggplot(gdf_rna_part, aes(x = WT_mean, y = mean_max_cov_WT)) + 
+  geom_point(alpha = 0.3)  +
+  stat_cor(method = "pearson") +
+  geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
+  scale_x_log10() + scale_y_log10()
+p
+p <- ggplot(gdf_rna_part, aes(x = gene_length, y = nclus_WT)) + 
+  geom_point(alpha = 0.3)  +
+  scale_x_log10() +
+  stat_cor(method = "pearson") +
+  geom_smooth(method="lm", se = TRUE, color = "darkgrey")
+p
+
+## 6M
+gdf_rna_part <- gdf_rna %>% dplyr::filter(nclus_6M > 0)
+mean_6M <- gdf_rna_part %>% dplyr::select("6M1", "6M2", "6M3", "6M4") %>% rowMeans()
+p <- ggplot(gdf_rna_part, aes(x = mean_6M, y = nclus_6M)) + 
+  geom_point(alpha = 0.3)  +
+  stat_cor(method = "pearson") +
+  geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
+  scale_x_log10()
+p
+p <- ggplot(gdf_rna_part, aes(x = mean_6M, y = mean_max_cov_6M)) + 
+  geom_point(alpha = 0.3)  +
+  stat_cor(method = "pearson") +
+  geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
+  scale_x_log10() + scale_y_log10()
+p
+p <- ggplot(gdf_rna_part, aes(x = gene_length, y = nclus_6M)) + 
+  geom_point(alpha = 0.3)  +
+  scale_x_log10() +
+  stat_cor(method = "pearson") +
+  geom_smooth(method="lm", se = TRUE, color = "darkgrey")
+
+p
+
+## RBDm
+gdf_rna_part <- gdf_rna %>% dplyr::filter(nclus_RBDm > 0)
+RBDm_mean <- gdf_rna_part %>% dplyr::select(RBDm1, RBDm2, RBDm3, RBDm4) %>% rowMeans()
+p <- ggplot(gdf_rna_part, aes(x = RBDm_mean, y = nclus_RBDm)) + 
+  geom_point(alpha = 0.3)  +
+  stat_cor(method = "pearson") +
+  geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
+  scale_x_log10()
+p
+p <- ggplot(gdf_rna_part, aes(x = RBDm_mean, y = mean_max_cov_RBDm)) + 
+  geom_point(alpha = 0.3)  +
+  stat_cor(method = "pearson") +
+  geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
+  scale_x_log10() + scale_y_log10()
+p
+p <- ggplot(gdf_rna_part, aes(x = gene_length, y = nclus_RBDm)) + 
+  geom_point(alpha = 0.3)  +
+  scale_x_log10() +
+  stat_cor(method = "pearson") +
+  geom_smooth(method="lm", se = TRUE, color = "darkgrey")
+p
+```
+
+
+
+## Venn diagram
+
+Venn and euler diagram of the genes with at least one cluster.
+
+```{r venn-diagram}
+gene_list <- list("WT" = gdf$gene_id[gdf$nclus_WT>0], 
+                  "6M" = gdf$gene_id[gdf$nclus_6M>0], 
+                  "RBDm" = gdf$gene_id[gdf$nclus_RBDm>0])
+
+euler_diag <- euler(gene_list, shape = "circle")
+venn_diag <- venn(gene_list)
+
+eulerr_options(labels = list(fontsize = 20), 
+               quantities = list(fontsize = 20, font = 2), 
+               fills = list(alpha = 0.5),
+               padding = unit(0.6, "lines"))
+
+p <- plot(euler_diag, font=1, 
+     fills=c("#117733", "#882255", "steelblue3"),
+     edges=c("#117733", "#882255", "steelblue3"),
+     labels = list(col = c("#117733", "#882255", "steelblue4")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+
+
+p <- plot(venn_diag,font=1, 
+     fills=c("#117733", "#882255", "steelblue3"),
+     edges=c("#117733", "#882255", "steelblue3"),
+     labels = list(col = c("#117733", "#882255", "steelblue4")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+```
+
+What are the genes with clusters in only the 6M or RBDm samples?
+
+```{r unique_clusters}
+## 6M specific
+gdf %>% dplyr::filter(nclus_WT == 0 & nclus_RBDm == 0) %>% dplyr::pull(gene_name)
+
+## RBDm specific
+gdf %>% dplyr::filter(nclus_WT == 0 & nclus_6M == 0) %>% dplyr::pull(gene_name)
+```
+
+## Compare target genes of the two lists
+
+```{r venn-diag-compare-lists}
+g_list <- list(my = gdf_my$gene_id,
+               mp = gdf$gene_id)
+euler_diag <- euler(g_list, shape = "circle")
+venn_diag <- venn(g_list)
+eulerr_options(labels = list(fontsize = 20), 
+               quantities = list(fontsize = 20, font = 2), 
+               fills = list(alpha = 0.5),
+               padding = unit(0.6, "lines"))
+
+
+gdf$gene_name[! gdf$gene_id %in% gdf_my$gene_id ] %>% head
+
+gdf_my$gene_name[! gdf_my$gene_id %in% gdf$gene_id ] %>% head
+
+p <- plot(euler_diag, font=1, 
+     fills=c("darkorange", "grey20"),
+     edges=c("darkorange", "grey20"),
+     labels = list(col = c("darkorange", "grey20")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+
+p <- plot(venn_diag,font=1, 
+     fills=c("darkorange", "grey20"),
+     edges=c("darkorange", "grey20"),
+     labels = list(col = c("darkorange", "grey20")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+
+## genes unique to mp 
+gdf$gene_name[! gdf$gene_id %in% gdf_my$gene_id ]
+## genes unique to my pipeline
+gdf_my$gene_name[! gdf_my$gene_id %in% gdf$gene_id ] %>% head(n = 100)
+```
+
+Number of peaks per gene from both pipelines.
+```{r n-peaks-per-gene}
+gdf_b <- gdf %>% dplyr::full_join(gdf_my, 
+                                  by = c("seqnames", "start", "end", "strand",
+                                         "gene_id", "gene_name", "gene_biotype"), 
+                                  suffix = c(".mp", ".my"))
+dim(gdf_b)
+
+p <- ggplot(gdf_b, aes(x = nclus_WT.my, y = nclus_WT.mp)) + 
+  geom_point(alpha = 0.3) + 
+  theme_bw() + geom_abline(intercept = 0, color = "blue")
+p
+
+p <- ggplot(gdf_b, aes(x = nclus_6M.my, y = nclus_6M.mp)) + 
+  geom_point(alpha = 0.3) + 
+  theme_bw() + geom_abline(intercept = 0, color = "blue")
+p
+
+p <- ggplot(gdf_b, aes(x = nclus_RBDm.my, y = nclus_RBDm.mp)) + 
+  geom_point(alpha = 0.3) + 
+  theme_bw() + geom_abline(intercept = 0, color = "blue")
+p
+```
+
+Mean maximal coverage per gene of both pipelines.
+```{r mean-max-cov-per-gene}
+p <- ggplot(gdf_b, aes(x = mean_max_cov_WT.my, y = mean_max_cov_WT.mp)) + 
+  geom_point(alpha = 0.3) + 
+  theme_bw() + geom_abline(intercept = 0, color = "blue")
+p
+
+p <- ggplot(gdf_b, aes(x = mean_max_cov_6M.my, y = mean_max_cov_6M.mp)) + 
+  geom_point(alpha = 0.3) + 
+  theme_bw() + geom_abline(intercept = 0, color = "blue")
+p
+
+p <- ggplot(gdf_b, aes(x = mean_max_cov_RBDm.my, y = mean_max_cov_RBDm.mp)) + 
+  geom_point(alpha = 0.3) + 
+  theme_bw() + geom_abline(intercept = 0, color = "blue")
+p
+```
+
+
+
+### UpSet plots of peak overlap
+Do the peak from the two pipelines overlap?
+
+We use UpSet plots because it can transform GRanges to combinatorial matrices. The intersection is the number of overlapping nucleotides in the clusters of the two sets.
+
+```{r upset-plots}
+cluster_list <- list(WT = mp[["WT"]],
+                     "6M" = mp[["6M"]],
+                    RBDm = mp[["RBDm"]])
+comb_mat <- make_comb_mat(cluster_list, mode = "distinct")
+
+## merge_peak 
+UpSet(comb_mat, set_order = c("WT", "6M", "RBDm"),
+      comb_col = c("steelblue", "#117733", "#882255")[comb_degree(comb_mat)])
+
+## my pipeline
+cluster_list <- list(WT = my[["WT"]],
+                     "6M" = my[["6M"]],
+                    RBDm = my[["RBDm"]])
+comb_mat <- make_comb_mat(cluster_list, mode = "distinct")
+UpSet(comb_mat, set_order = c("WT", "6M", "RBDm"),
+      comb_col = c("steelblue", "#117733", "#882255")[comb_degree(comb_mat)])
+
+
+## WT peaks from both pipelines
+cluster_list <- list(mp_WT = mp[["WT"]],
+                     my_WT = my[["WT"]])
+strand(cluster_list[["mp_WT"]]) <- "*"
+comb_mat <- make_comb_mat(cluster_list, mode = "distinct")
+UpSet(comb_mat, set_order = c("mp_WT", "my_WT"),
+      comb_col = c("steelblue", "#117733", "#882255")[comb_degree(comb_mat)])
+
+## 6M peaks from both pipelines
+cluster_list <- list(mp_6M = mp[["6M"]],
+                     my_6M = my[["6M"]])
+strand(cluster_list[["mp_6M"]]) <- "*"
+comb_mat <- make_comb_mat(cluster_list, mode = "distinct")
+UpSet(comb_mat, set_order = c("mp_6M", "my_6M"),
+      comb_col = c("steelblue", "#117733", "#882255")[comb_degree(comb_mat)])
+
+## RBDm peaks from both pipelines
+cluster_list <- list(mp_RBDm = mp[["RBDm"]],
+                     my_RBDm = my[["RBDm"]])
+strand(cluster_list[["mp_RBDm"]]) <- "*"
+comb_mat <- make_comb_mat(cluster_list, mode = "distinct")
+UpSet(comb_mat, set_order = c("mp_RBDm", "my_RBDm"),
+      comb_col = c("steelblue", "#117733", "#882255")[comb_degree(comb_mat)])
+```
+
+
+
+# Classification of genes
+
+We classify the genes with at least one cluster into unique and shared genes per group.
+There are three unique sets: genes with clusters from only one group: WT, 6M and RBDm specific.
+There are three sets that are shared between two groups: WT-6M, WT-RBDm, 6M-RBDm
+There is one set that is shared between all three groups: WT-6M-RBDm.
+```{r gene-sets}
+## all target genes of WT, 6M and RBDm
+gene_sets <- list(WT = gdf %>% dplyr::filter(nclus_WT > 0), 
+                  "6M" = gdf %>% dplyr::filter(nclus_6M > 0),
+                  RBDm = gdf %>% dplyr::filter(nclus_RBDm > 0))
+lapply(gene_sets, nrow)
+
+## all target genes unique to WT, shared between WT and 6M 
+## or shared between WT, 6M and RBDm
+gene_sets_wt <- list(WT = gdf %>% 
+                dplyr::filter(nclus_WT > 0 & nclus_6M == 0 & nclus_RBDm == 0), 
+                  "6M" = gdf %>% 
+                dplyr::filter(nclus_WT > 0 & nclus_6M > 0 & nclus_RBDm == 0),
+                RBDm6M = gdf %>% 
+                dplyr::filter(nclus_WT > 0 & nclus_6M > 0 & nclus_RBDm > 0))
+lapply(gene_sets_wt, nrow)
+```
+
+
+## Distribution of gene biotype
+
+```{r gene-biotype-distr}
+# number of genes
+lapply(gene_sets, function(x) x$gene_biotype %>% table)
+# percentage
+lapply(gene_sets, function(x){
+  a <- x$gene_biotype
+  n <- length(a)
+  round(table(a)/n*100, digits = 2)}
+  )
+
+data.frame(sample = c(rep("WT", nrow(gene_sets[["WT"]])),
+                      rep("6M", nrow(gene_sets[["6M"]])),
+                      rep("RBDm", nrow(gene_sets[["RBDm"]]))),
+           biotype = c(gene_sets[["WT"]]$gene_biotype,
+                       gene_sets[["6M"]]$gene_biotype, 
+                       gene_sets[["RBDm"]]$gene_biotype)) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("WT", "6M", "RBDm"))) %>%
+  dplyr::group_by(sample, biotype) %>% dplyr::summarize(nr_genes = n()) %>%
+  ggplot(aes(x = sample, y = nr_genes, fill = biotype)) + 
+    geom_bar(position = "fill", stat = "identity") + 
+    theme_bw() +
+    facet_wrap(~sample, nrow = 1, scales = "free_x") +
+    theme(text = element_text(size = 14), legend.position = "right", 
+          # legend.direction="horizontal", legend.box = "horizontal", 
+          plot.title = element_text(hjust = 0.5)) +
+    ylab("fraction of genes")
+```
+
+
+
+## Distribution of gene length
+```{r gene-length-distribution}
+lapply(gene_sets, function(x) summary(x$end - x$start+1))
+
+data.frame(gene_set = c(rep("WT", nrow(gene_sets[["WT"]])),
+                        rep("6M", nrow(gene_sets[["6M"]])), 
+                        rep("RBDm", nrow(gene_sets[["RBDm"]]))),
+           gene_length = c(gene_sets[["WT"]]$end - gene_sets[["WT"]]$start +1,
+                           gene_sets[["6M"]]$end - gene_sets[["6M"]]$start +1,
+                           gene_sets[["RBDm"]]$end - 
+                             gene_sets[["RBDm"]]$start +1)) %>%
+  ggplot(aes(x = gene_set, y = gene_length)) +
+    geom_violin() + 
+    geom_boxplot(width=0.1) + theme_bw() + scale_y_log10()
+```
+
+## Distribution of gene expression
+
+We plot the mean expression of the replicates in each group.
+```{r gene-expression-distribution, message = FALSE, warning = FALSE}
+gdf_rna <- gdf_rna %>% 
+  dplyr::mutate(mean_wt = rowMeans(gdf_rna %>% dplyr::select(starts_with("WT"))),
+                mean_6M = rowMeans(gdf_rna %>% dplyr::select(starts_with("6M"))),
+                mean_RBDm = rowMeans(gdf_rna %>% dplyr::select(starts_with("RBDm")))) 
+
+gene_sets_rna <- list(WT = gdf_rna %>% dplyr::filter(nclus_WT > 0), 
+                  "6M" = gdf_rna %>% dplyr::filter(nclus_6M > 0),
+                  RBDm = gdf_rna %>% dplyr::filter(nclus_RBDm > 0))
+
+data.frame(gene_set = c(rep("WT", nrow(gene_sets_rna[["WT"]])),
+                        rep("6M", nrow(gene_sets_rna[["6M"]])), 
+                        rep("RBDm", nrow(gene_sets_rna[["RBDm"]]))),
+           gene_expression = c(gene_sets_rna[["WT"]]$mean_wt,
+                               gene_sets_rna[["6M"]]$mean_wt,
+                               gene_sets_rna[["RBDm"]]$mean_wt)) %>%
+  ggplot(aes(x = gene_set, y = gene_expression)) +
+    geom_violin() + 
+    geom_boxplot(width=0.1) + theme_bw() + scale_y_log10()
+```
+
+
+## Annotate clusters
+
+We split the clusters according to the gene sets and annotate each cluster set to exons, introns, 3'UTR and 5'UTR.
+
+```{r cluster-annotation}
+## list with all clusters that overlap with the genes in the set.
+## a cluster can overlap with more than one annotation and might be counted more than once
+cluster_sets <- list()
+clusters_anno <- list()
+for (n in names(gene_sets_wt)) {
+    gene_ids <- gene_sets_wt[[n]]$gene_id
+    g <- genes[genes$gene_id %in% gene_ids]
+    ## annotations of all genes in the set
+    anno1 <- lapply(anno, function(x) {x[x$gene_id %in% gene_ids]})
+    anno1[["gene"]] <- NULL
+    for (s in names(mp)) {
+      olap <- subsetByOverlaps(mp[[s]], g, ignore.strand = FALSE)
+      if (length(olap) > 0) { 
+        cluster_sets[[n]][[s]] <- subsetByOverlaps(mp[[s]], g, 
+                                                   ignore.strand = FALSE)
+        
+        clusters_anno[[n]][[s]] <- lapply(anno1, function(x) {
+            subsetByOverlaps(cluster_sets[[n]][[s]], x, type = "any", 
+                             ignore.strand = FALSE)})
+      }
+    }
+}
+lapply(cluster_sets, lengths)
+## number of clusters in each region
+lapply(clusters_anno, function(x) {lapply(x, lengths)})
+```
+
+
+## Distribution of clusters in pre-mRNA
+
+We want to know if the clusters that are shared with WT or that are unique to 6M/RBDm are located in specific regions of the RNA.
+We generate a bar plot that shows the distribution of clusters in each of the gene sets. 
+```{r barplot, fig.width=10, fig.height=6}
+## summarise the counts in a table
+df <- data.frame(gene_set = NA, sample = NA)
+df_counts <- list()
+for (n in names(clusters_anno)) {
+  for (s in names(clusters_anno[[n]])) {
+    df_counts <- rbind(df_counts,  lengths(clusters_anno[[n]][[s]]))
+    df <- rbind(df, c(n, s))
+  }
+}
+## remove first row and add counts
+df <- df[-1,] %>% cbind(df_counts)
+df_long <- df %>% 
+  gather(key = "annotation", value = "clusters", -gene_set, -sample) %>%
+  dplyr::mutate(gene_set = factor(gene_set, 
+  levels = c("WT", "6M", "RBDm6M")),
+  genotype = factor(sample, levels = c("WT", "6M", "RBDm6M")),
+  annotation = factor(annotation, 
+            levels = c("five_prime_utr", "exon", "intron", "three_prime_utr")))
+
+## barplot with percentage of clusters per gene list and sample
+p <- ggplot(df_long, aes(x = sample, y = clusters, fill = annotation)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  theme_bw() +
+  facet_wrap(~gene_set, nrow = 1, scales = "free_x") +
+  theme(text = element_text(size = 14), legend.position = "bottom", 
+        legend.direction="horizontal", legend.box = "horizontal", 
+        plot.title = element_text(hjust = 0.5)) 
+p
+```
+
+
+### Distribution of gene biotype in genes shared with WT and 6M/RBDm
+
+```{r}
+lapply(gene_sets_wt, function(x) x$gene_biotype %>% table)
+
+data.frame(sample = c(rep("WT", nrow(gene_sets_wt[["WT"]])),
+                      rep("6M", nrow(gene_sets_wt[["6M"]])),
+                      rep("RBDm6M", nrow(gene_sets_wt[["RBDm6M"]]))),
+           biotype = c(gene_sets_wt[["WT"]]$gene_biotype,
+                       gene_sets_wt[["6M"]]$gene_biotype, 
+                       gene_sets_wt[["RBDm6M"]]$gene_biotype)) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("WT", "6M", "RBDm6M"))) %>%
+  dplyr::group_by(sample, biotype) %>% dplyr::summarize(nr_genes = n()) %>%
+  ggplot(aes(x = sample, y = nr_genes, fill = biotype)) + 
+    geom_bar(position = "fill", stat = "identity") + 
+    theme_bw() +
+    facet_wrap(~sample, nrow = 1, scales = "free_x") +
+    theme(text = element_text(size = 14), legend.position = "right", 
+          # legend.direction="horizontal", legend.box = "horizontal", 
+          plot.title = element_text(hjust = 0.5)) +
+    ylab("fraction of genes")
+```
+
+### Distribution of clusters in protein coding genes
+
+We subset the protein coding genes and plot the peak distribution in these genes.
+
+```{r barplot-cluster-distribution-protein-coding, fig.width=10, fig.height=6}
+## list with all clusters that overlap with the genes in the set.
+## a cluster can overlap with more than one annotation and might be counted more than once
+cluster_sets_pc <- list()
+clusters_anno_pc <- list()
+for (n in names(gene_sets_wt)) {
+  # filter all protein coding genes
+    gene_ids <- gene_sets_wt[[n]] %>% 
+      dplyr::filter(gene_biotype == "protein_coding") %>% pull(gene_id)
+    g <- genes[genes$gene_id %in% gene_ids]
+    ## annotations of all genes in the set
+    anno1 <- lapply(anno, function(x) {x[x$gene_id %in% gene_ids]})
+    anno1[["gene"]] <- NULL
+    for (s in names(mp)) {
+      olap <- subsetByOverlaps(mp[[s]], g, ignore.strand = FALSE)
+      if (length(olap) > 0) { 
+        cluster_sets_pc[[n]][[s]] <- subsetByOverlaps(mp[[s]], g, 
+                                                   ignore.strand = FALSE)
+        
+        clusters_anno_pc[[n]][[s]] <- lapply(anno1, function(x) {
+            subsetByOverlaps(cluster_sets_pc[[n]][[s]], x, type = "any", 
+                             ignore.strand = FALSE)})
+      }
+    }
+}
+lapply(cluster_sets_pc, lengths)
+## number of clusters in each region
+lapply(clusters_anno_pc, function(x) {lapply(x, lengths)})
+
+
+## summarise the counts in a table
+df <- data.frame(gene_set = NA, sample = NA)
+df_counts <- list()
+for (n in names(clusters_anno_pc)) {
+  for (s in names(clusters_anno_pc[[n]])) {
+    df_counts <- rbind(df_counts,  lengths(clusters_anno_pc[[n]][[s]]))
+    df <- rbind(df, c(n, s))
+  }
+}
+## remove first row and add counts
+df <- df[-1,] %>% cbind(df_counts)
+df_long <- df %>% 
+  gather(key = "annotation", value = "clusters", -gene_set, -sample) %>%
+  dplyr::mutate(gene_set = factor(gene_set, 
+  levels = c("WT", "6M", "RBDm6M")),
+  genotype = factor(sample, levels = c("WT", "6M", "RBDm6M")),
+  annotation = factor(annotation, 
+            levels = c("five_prime_utr", "exon", "intron", "three_prime_utr")))
+
+## barplot with percentage of clusters per gene list and sample
+p <- ggplot(df_long, aes(x = sample, y = clusters, fill = annotation)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  theme_bw() +
+  facet_wrap(~gene_set, nrow = 1, scales = "free_x") +
+  theme(text = element_text(size = 14), legend.position = "bottom", 
+        legend.direction="horizontal", legend.box = "horizontal", 
+        plot.title = element_text(hjust = 0.5)) 
+p
+```
+
+
+
+## ORA
+
+We conduct over representation analysis to characterize the gene sets.
+
+The background are all genes with the sum of normalized counts >= 10 (of all replicates).
+
+```{r import-RNAseq-counts}
+rna_wt <- rna %>% dplyr::filter(sum_wt >= 10) %>% pull(Gene)                
+rna_6M <- rna %>% dplyr::filter(sum_6M >= 10) %>% pull(Gene)                
+rna_RBDm <- rna %>% dplyr::filter(sum_RBDm >= 10) %>% pull(Gene)      
+rna_bg <- unique(c(rna_wt, rna_6M, rna_RBDm))
+```
+
+
+```{r convert-ensembl-ID-entrez}
+## convert to Entrez IDs
+ensembl <- useMart("ensembl")
+ensembl <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+
+if (file.exists(here("Rmd", "rds", "rna_bg_entrez.rds"))) {
+  rna_bg <- readRDS(here("Rmd", "rds", "rna_bg_entrez.rds"))  
+} else{
+  ## convert to Entrez IDs
+  bg <- getBM(attributes = c("ensembl_gene_id","entrezgene_id"), 
+                         values = rna_bg, mart = ensembl )
+  bg <- bg[bg$ensembl_gene_id %in% rna_bg, ]
+  saveRDS(bg, here("Rmd", "rds", "rna_bg_entrez.rds")) 
+}
+
+## number of genes in the bg set
+nrow(bg)
+```
+
+
+```{r ORA)}
+ora_res <- list()
+for (s in names(gene_sets)) {
+  ids <- unique(gene_sets[[s]]$gene_id)
+
+  if (file.exists(here("Rmd", "rds", paste0(s, "_mp_WT_entrez.rds")))) {
+    entrez_ids <- readRDS(here("Rmd", "rds", paste0(s, "_mp_WT_entrez.rds")))  
+  } else{
+    ## convert the Ensembl Gene IDs to entrez Gene IDs with Biomart
+    entrez_ids <- getBM(attributes = c("ensembl_gene_id","entrezgene_id"), 
+                 values = ids, mart = ensembl )
+    ## we only keep the genes from our initial list
+    entrez_ids <- entrez_ids[entrez_ids$ensembl_gene_id %in% ids, ]
+    saveRDS(entrez_ids, here("Rmd", "rds", paste0(s, "_mp_WT_entrez.rds"))) 
+  }
+  
+  ## Match gene length to bg list
+  m <- match(bg$ensembl_gene_id, genes$gene_id)
+  gene_length <- width(genes)[m]
+  
+  ## GO analysis with goana using gene length as covariate
+  goana_res <- goana(de = unique(entrez_ids$entrezgene), species = "Hs", 
+                     universe = bg$entrezgene, covariate = gene_length)
+  goana_res <- goana_res[order(goana_res$P.DE, decreasing = FALSE),]
+  ora_res[[s]] <- goana_res
+  
+  ## write results
+  write.table(topGO(goana_res, ontology = "CC", number = 100),
+              here("analysis", "goana", paste0(s, "_mp_WT_goana_CC.txt")),
+              sep = "\t", quote = FALSE)
+  write.table(topGO(goana_res, ontology = "BP", number = 100),
+              here("analysis", "goana", paste0(s, "_mp_WT_goana_BP.txt")),
+              sep = "\t", quote = FALSE)
+  write.table(topGO(goana_res, ontology = "MF", number = 100),
+              here("analysis", "goana", paste0(s, "_mp_WT_goana_MF.txt")),
+              sep = "\t", quote = FALSE)
+}
+```
+
+```{r print-ora-res}
+for (s in names(ora_res)) {
+  print(s)
+  ## What are the most enriched annotation terms?
+  print(topGO(ora_res[[s]], ontology = "CC", number = 10))
+  print(topGO(ora_res[[s]], ontology = "BP", number = 10))
+  print(topGO(ora_res[[s]], ontology = "MF", number = 10))
+}
+```
+
+
+# Difference in binding between WT and 6M or RBDm
+
+We want to compare the binding patterns of WT and 6M/RBDm. We are interested to know if the binding in 6M/RBDm is just weaker but binds the same peaks or if it is only a subset of WT. 
+```{r peak-lists-WT-6M}
+## we split the peaks according to gene_id
+ids <- gdf$gene_id[gdf$nclus_6M>0 & gdf$nclus_WT>0]
+genes1 <- genes[genes$gene_id %in% ids]
+olaps1 <- findOverlaps(genes1, mp[["6M"]], ignore.strand=FALSE)
+subjectHits(olaps1) %>% length
+unique(subjectHits(olaps1)) %>% length
+unique(queryHits(olaps1)) %>% length
+olaps2 <- findOverlaps(genes1, mp[["WT"]], ignore.strand=FALSE)
+subjectHits(olaps2) %>% length
+unique(subjectHits(olaps2)) %>% length
+unique(queryHits(olaps2)) %>% length
+
+## RBDM
+ids2 <- gdf$gene_id[gdf$nclus_RBDm>0 & gdf$nclus_WT>0]
+genes2 <- genes[genes$gene_id %in% ids2]
+olaps3 <- findOverlaps(genes2, mp[["RBDm"]], ignore.strand=FALSE)
+subjectHits(olaps3) %>% length
+unique(subjectHits(olaps3)) %>% length
+unique(queryHits(olaps3)) %>% length
+olaps4 <- findOverlaps(genes2, mp[["WT"]], ignore.strand=FALSE)
+subjectHits(olaps4) %>% length
+unique(subjectHits(olaps4)) %>% length
+unique(queryHits(olaps4)) %>% length
+
+
+peaks_split <- list("6M" = list("WT" = split(mp[["WT"]][subjectHits(olaps2)], 
+                                             genes1$gene_id[queryHits(olaps2)]), 
+                                "6M" = split(mp[["6M"]][subjectHits(olaps1)],
+                                             genes1$gene_id[queryHits(olaps1)])),
+                    "RBDm" = list("WT" = split(mp[["WT"]][subjectHits(olaps4)], 
+                                               genes2$gene_id[queryHits(olaps4)]),
+                                  "RBDm" = split(mp[["RBDm"]][subjectHits(olaps3)], 
+                                                 genes2$gene_id[queryHits(olaps3)])))
+```
+
+For this, we overlap the peak locations of the two samples and classify the genes according to the percentage of peak overlap between the two samples.
+
+```{r overlap-peaks-6M-WT}
+## compare the peak locations per gene in terms of
+compare_peaks <- function(x, wt, p){
+  wt <- wt[[x]]
+  p <- p[[x]]
+  ## number of total peaks (6M, WT)  
+  nwt <- length(wt)
+  np <- length(p)
+  ## length (bp) of total peaks (6M, WT)  
+  lwt <- sum(width(wt))
+  lp <- sum(width(p))
+  ## number of overlapping peaks (6M, WT)
+  olap <- findOverlapPairs(p, wt)
+  nop <- length(unique(olap@first))
+  nowt <- length(unique(olap@second))
+  ## length (bp) of overlapping peaks (6M, WT)  
+  obp <- sum(width(pintersect(olap)))
+  ## percentage of overlapping peaks (6M, WT)  
+  perc_p <- round(nop/np*100, 2)
+  perc_wt <- round(nowt/nwt*100, 2)
+  ## percentage of overlapping bp (6M, WT) 
+  perc_bp_p <- round(obp/lp*100, 2)
+  perc_bp_wt <- round(obp/lwt*100, 2)
+  c(nwt, np, lwt, lp, nowt, nop, obp, perc_wt, perc_p, perc_bp_wt, perc_bp_p)
+}
+
+peaks_olap_RBDm <- t(sapply(names(peaks_split[["RBDm"]][["WT"]]), compare_peaks, 
+                            wt = peaks_split[["RBDm"]][["WT"]], 
+                            p = peaks_split[["RBDm"]][["RBDm"]]))
+
+colnames(peaks_olap_RBDm) <- c("nr_peaks_WT", "nr_peaks_RBDm", "bp_WT", 
+                               "bp_RBDm", "nr_olap_peaks_WT", 
+                               "nr_olap_peaks_RBDm", "bp_olap", "perc_peaks_WT", 
+                               "perc_peaks_RBDm", "perc_bp_WT", "perc_bp_RBDm")
+peaks_olap_RBDm <-  as.data.frame(peaks_olap_RBDm)
+peaks_olap_RBDm$gene_id <- rownames(peaks_olap_RBDm)
+head(peaks_olap_RBDm)
+
+
+peaks_olap_6M <- t(sapply(names(peaks_split[["6M"]][["WT"]]), compare_peaks, 
+                            wt = peaks_split[["6M"]][["WT"]], 
+                            p = peaks_split[["6M"]][["6M"]]))
+
+colnames(peaks_olap_6M) <- c("nr_peaks_WT", "nr_peaks_6M", "bp_WT", 
+                               "bp_6M", "nr_olap_peaks_WT", 
+                               "nr_olap_peaks_6M", "bp_olap", "perc_peaks_WT", 
+                               "perc_peaks_6M", "perc_bp_WT", "perc_bp_6M")
+peaks_olap_6M <-  as.data.frame(peaks_olap_6M)
+peaks_olap_6M$gene_id <- rownames(peaks_olap_6M)
+head(peaks_olap_6M)
+```
+
+
+
+## Distribution of peak overlaps
+
+```{r plot-overlap-distribution}
+## distribution of percentage of overlapping peaks and bp
+## RBDm
+peaks_olap_RBDm$perc_peaks_RBDm %>% summary
+peaks_olap_RBDm$perc_peaks_WT %>% summary
+peaks_olap_RBDm$perc_bp_RBDm %>% summary
+peaks_olap_RBDm$perc_bp_WT %>% summary
+## 6M
+peaks_olap_6M$perc_peaks_6M %>% summary
+peaks_olap_6M$perc_peaks_WT %>% summary
+peaks_olap_6M$perc_bp_6M %>% summary
+peaks_olap_6M$perc_bp_WT %>% summary
+
+p1 <- ggplot(peaks_olap_RBDm, aes(x = "WT", y = perc_bp_WT)) + 
+  geom_violin() + geom_boxplot(width = 0.1) + theme_bw() + ggtitle("RBDm")
+p2 <- ggplot(peaks_olap_RBDm, aes(x = "RBDm", y = perc_bp_RBDm)) + 
+  geom_violin() + geom_boxplot(width = 0.1) + theme_bw() + ggtitle("RBDm")
+p3 <- ggplot(peaks_olap_6M, aes(x = "WT", y = perc_bp_WT)) + 
+  geom_violin() + geom_boxplot(width = 0.1) + theme_bw() + ggtitle("6M")
+p4 <- ggplot(peaks_olap_6M, aes(x = "6M", y = perc_bp_6M)) + 
+  geom_violin() + geom_boxplot(width = 0.1) + theme_bw() + ggtitle("6M")
+ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2)
+```
+
+The majority of 6M or RBDm peaks are nearly fully overlapping with WT peaks. However, only a subset of the WT peaks are overlapping 6M/RBDm peaks. This means that 6M/RBDm bind to regions than WT, but some genes are only bound in a subset of WT binding sites. 
+
+We classify the genes into genes with less than 50% 6M/RBdm bp overlap and genes bound with at least 75% of WT peak bp, 25%-75% and less than 25%.
+```{r classify-targets-6M}
+peaks_olap_RBDm <- peaks_olap_RBDm %>% 
+  dplyr::mutate(class = factor(ifelse(perc_bp_RBDm < 50, "different binding", 
+                                      ifelse(perc_bp_WT < 25, "<25% overlap",
+                                             ifelse(perc_bp_WT < 75, "25%-75% overlap", 
+                                                    ">75% overlap"))),
+                               levels = c("different binding", "<25% overlap",
+                                          "25%-75% overlap", ">75% overlap")))
+
+peaks_olap_6M <- peaks_olap_6M %>% 
+  dplyr::mutate(class = factor(ifelse(perc_bp_6M < 50, "different binding", 
+                                      ifelse(perc_bp_WT < 25, "<25% overlap",
+                                             ifelse(perc_bp_WT < 75, "25%-75% overlap", 
+                                                    ">75% overlap"))),
+                               levels = c("different binding", "<25% overlap",
+                                          "25%-75% overlap", ">75% overlap")))
+
+ggplot(peaks_olap_RBDm, aes(x = perc_peaks_RBDm, y = perc_peaks_WT, color = class)) + 
+  geom_point(alpha= 0.5) + 
+  theme_bw()
+
+ggplot(peaks_olap_RBDm, aes(x = perc_bp_RBDm, y = perc_bp_WT, color = class)) + 
+  geom_point(alpha= 0.5) + 
+  theme_bw()
+
+ggplot(peaks_olap_6M, aes(x = perc_peaks_6M, y = perc_peaks_WT, color = class)) + 
+  geom_point(alpha= 0.5) + 
+  theme_bw()
+
+ggplot(peaks_olap_6M, aes(x = perc_bp_6M, y = perc_bp_WT, color = class)) + 
+  geom_point(alpha= 0.5) + 
+  theme_bw()
+
+
+## we add the gene name and location, sort by class and save the tables
+peaks_olap_RBDm <- peaks_olap_RBDm %>% 
+  left_join(gdf %>% dplyr::select(gene_id, seqnames, start, end, strand, 
+                                  gene_name, gene_biotype), 
+            by = "gene_id") %>% dplyr::arrange(class, perc_peaks_WT)
+head(peaks_olap_RBDm)
+peaks_olap_6M <- peaks_olap_6M %>% 
+  left_join(gdf %>% dplyr::select(gene_id, seqnames, start, end, strand, 
+                                  gene_name, gene_biotype), 
+            by = "gene_id") %>% dplyr::arrange(class, perc_peaks_WT)
+head(peaks_olap_6M)
+
+write.table(peaks_olap_RBDm, here("analysis", "clipper_analysis", "peak_overlap_class_RBDm.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+write.table(peaks_olap_6M, here("analysis", "clipper_analysis", "peak_overlap_class_6M.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+
+# Hexamer occurrence in peak sequences
+
+We count the number of occurence of each hexamer in the peak sequences. 
+
+```{r count-hexamers-mp}
+genome <- BSgenome.Hsapiens.UCSC.hg38
+## observed count per hexamer
+obs <- lapply(mp, function(x) {
+  seq <- getSeq(genome, x)
+  oligonucleotideFrequency(seq, width = 6, step = 1, 
+                                  simplify.as = "collapsed")
+})
+
+## observed versus expected (equal frequency)
+obs_exp <- lapply(obs, function(x) {
+  expected <- sum(x)/length(x)
+  x/expected
+  })
+
+hex_df <- data.frame(hexamer = rep(names(obs_exp[[1]]), times = 3), 
+                     sample = rep(names(obs_exp), each = length(obs_exp[[1]])),
+                     obs_exp_freq = c(obs_exp[[1]], obs_exp[[2]], obs_exp[[3]]))
+
+p <- ggplot(hex_df, aes(x = obs_exp_freq, fill = sample)) + 
+  geom_histogram(bins = 50, position = "dodge") +
+  # scale_y_continuous(trans = 'log1p') +
+  facet_wrap(~sample)
+  
+p
+
+## What are the hexamers with the highest ratio?
+hex_df %>% dplyr::filter(sample == "WT") %>% 
+  dplyr::arrange(desc(obs_exp_freq)) %>% head(n = 20)
+
+hex_df %>% dplyr::filter(sample == "6M") %>% 
+  dplyr::arrange(desc(obs_exp_freq)) %>% head(n = 20)
+
+hex_df %>% dplyr::filter(sample == "RBDm") %>% 
+  dplyr::arrange(desc(obs_exp_freq)) %>% head(n = 20)
+
+
+## correlation of frequency ratio between samples
+hex_df_wide <- hex_df %>% 
+  tidyr::pivot_wider(names_from = sample, values_from = obs_exp_freq)
+
+p <- ggplot(hex_df_wide, aes(x = `6M`, y = WT, label = hexamer)) + 
+  geom_point(alpha = 0.3) +
+  geom_text_repel(data = hex_df_wide %>% dplyr::arrange(desc(`6M`)) %>% dplyr::slice(1:30))
+p
+p <- ggplot(hex_df_wide, aes(x = `6M`, y = RBDm, label = hexamer)) + 
+  geom_point(alpha = 0.3) +
+  geom_text_repel(data = hex_df_wide %>% dplyr::arrange(desc(`6M`)) %>% dplyr::slice(1:20))
+p
+p <- ggplot(hex_df_wide, aes(x = RBDm, y = WT, label = hexamer)) +
+  geom_point(alpha = 0.3) +
+  geom_text_repel(data = hex_df_wide %>% dplyr::arrange(desc(`WT`)) %>% dplyr::slice(1:20))
+p
+```
+
+### Compare with hexamers from my pipeline
+
+We compare the hexamer counts with the peak sequences from my pipeline.
+
+```{r conunt-hexamer-my}
+my_obs <- lapply(my, function(x) {
+  seq <- getSeq(genome, x)
+  oligonucleotideFrequency(seq, width = 6, step = 1, 
+                                  simplify.as = "collapsed")
+})
+
+## observed versus expected (equal frequency)
+my_obs_exp <- lapply(my_obs, function(x) {
+  expected <- sum(x)/length(x)
+  x/expected
+  })
+
+my_hex_df <- data.frame(hexamer = rep(names(my_obs_exp[[1]]), times = 3), 
+                     sample = rep(names(my_obs_exp), each = length(my_obs_exp[[1]])),
+                     obs_exp_freq = c(my_obs_exp[[1]], my_obs_exp[[2]], my_obs_exp[[3]]))
+
+p <- ggplot(my_hex_df, aes(x = obs_exp_freq, fill = sample)) + 
+  geom_histogram(bins = 50, position = "dodge") +
+  # scale_y_continuous(trans = 'log1p') +
+  facet_wrap(~sample)
+p
+
+
+## What are the hexamers with the highest ratio?
+my_hex_df %>% dplyr::filter(sample == "WT") %>% 
+  dplyr::arrange(desc(obs_exp_freq)) %>% head(n = 20)
+
+my_hex_df %>% dplyr::filter(sample == "6M") %>% 
+  dplyr::arrange(desc(obs_exp_freq)) %>% head(n = 20)
+
+my_hex_df %>% dplyr::filter(sample == "RBDm") %>% 
+  dplyr::arrange(desc(obs_exp_freq)) %>% head(n = 20)
+
+my_hex_df_wide <- my_hex_df %>% 
+  tidyr::pivot_wider(names_from = sample, values_from = obs_exp_freq)
+
+
+## comparison
+hex_df_comb <- hex_df_wide %>% left_join(my_hex_df_wide, by = c("hexamer"), suffix = c(".mp", ".my"))
+
+p <- ggplot(hex_df_comb, aes(x = `6M.mp`, y = `6M.my`, label = hexamer)) + 
+  geom_point(alpha = 0.3) +
+  geom_text_repel(data = rbind(hex_df_comb %>% dplyr::arrange(desc(`6M.mp`)) %>% dplyr::slice(1:20),
+                               hex_df_comb %>% dplyr::arrange(desc(`6M.my`)) %>% dplyr::slice(1:20)) %>% unique)
+p
+p <- ggplot(hex_df_comb, aes(x = RBDm.mp, y = RBDm.my, label = hexamer)) + 
+  geom_point(alpha = 0.3) +
+  geom_text_repel(data = rbind(hex_df_comb %>% dplyr::arrange(desc(RBDm.mp)) %>% dplyr::slice(1:20),
+                               hex_df_comb %>% dplyr::arrange(desc(RBDm.my)) %>% dplyr::slice(1:20)) %>% unique)
+p
+p <- ggplot(hex_df_comb, aes(x = WT.mp, y = WT.my, label = hexamer)) + 
+  geom_point(alpha = 0.3) +
+  geom_text_repel(data = rbind(hex_df_comb %>% dplyr::arrange(desc(WT.mp)) %>% dplyr::slice(1:20),
+                               hex_df_comb %>% dplyr::arrange(desc(WT.my)) %>% dplyr::slice(1:20)) %>% unique)
+p
+```
+
+
+# Overlapping gene annotations
+
+How many peaks overlap with more than one gene?
+
+```{r olap-annotations}
+for(i in names(mp)){
+  mp[[i]]$nr_olap_anno <- countOverlaps(mp[[i]], genes, ignore.strand = FALSE)
+}
+
+## number of peaks with a specific number of overlapping genes
+lapply(mp, function(x) table(x$nr_olap_anno))
+## percentage of peaks
+(perc <- lapply(mp, function(x) round(table(x$nr_olap_anno)/length(x)*100, 2)))
+
+pdat <- data.frame(matrix(unlist(perc), nrow=length(perc), byrow=TRUE))
+colnames(pdat) <- names(perc[[1]])
+pdat$sample <- factor(names(perc)) %>% relevel("WT")
+(pdat <- pdat %>% tidyr::gather(key = "n_anno", value = "percentage", -sample))
+
+ggplot(pdat, aes(x = sample, y = percentage, fill = n_anno)) + 
+  geom_bar(stat = "identity") + 
+  ylab("percentage of peaks") +
+  theme_bw(base_size = 12) + scale_fill_discrete(name = "overlapping\nannotations")
+
+## what are the genes that are overlapping, are they all in the gdf data frame?
+olap <- findOverlaps(mp[["RBDm"]], genes, ignore.strand = FALSE)
+genes[subjectHits(olap)][!genes[subjectHits(olap)]$gene_id %in% gdf$gene_id]
+## these are the pseudogenes that we filterd out in the beginning
+
+## How many not protein-coding RNAs are only bound by RBD/6M but not WT?
+gdf$gene_biotype %>% table
+gdf_fl <- gdf[gdf$gene_biotype != "protein_coding",]
+## all genes with RBDm peaks
+ind <- which(gdf_fl$nclus_RBDm > 0)
+length(ind)
+## how many of these do not have any WT peaks?
+table(gdf_fl[ind,]$nclus_WT == 0)
+```
+
+
+For all RBDm targets, what is the difference in the number of peaks in WT and RBDm? Are some of the genes FP, because RBDm is actually only binding the overlapping non-coding RNAs?
+
+```{r fig.withd = 12, fig.heigth = 10}
+gdf_fl <- gdf[gdf$nclus_RBDm > 0,]
+table(gdf_fl$gene_biotype)
+## protein coding
+pdat <- gdf_fl[,c("gene_biotype", "nclus_RBDm", "nclus_WT")]  
+head(pdat)
+
+ggplot(pdat, aes(x = nclus_RBDm, y = nclus_WT)) + 
+  geom_point(alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "blue") + 
+  facet_wrap(~gene_biotype, scales = "fixed") + 
+  theme_bw(base_size = 12) + theme(aspect.ratio=1) +
+  xlab("number of RBDm peaks") + ylab("number of WT peaks")
+```
+
+
+For all protein coding genes, if RBDm peaks are exclusively present in regions overlapping to small RNA gene, it gets reassigned to that gene and the annotation to the protein-coding gene is removed.
+```{r}
+## all protein coding genes with RBDm peaks
+pc_genes <- gdf_fl[gdf_fl$gene_biotype == "protein_coding", "gene_id"]
+# pc_ind <- which(gdf_fl$gene_biotype == "protein_coding")
+gdf_fl[gdf_fl$gene_id %in% pc_genes,] %>% dim
+m <- match(pc_genes, genes$gene_id)
+## all pc genes with RBDm peaks with overlapping annotations
+pc_genes <- subsetByOverlaps(genes[m], 
+                             mp[["RBDm"]][mp[["RBDm"]]$nr_olap_anno > 1])
+
+## what are lengths of the different RNAs types in the tabe
+for(x in unique(gdf$gene_biotype)){
+  print(x)
+  print(summary(lengths(genes[genes$gene_id %in% gdf$gene_id[gdf$gene_biotype == x]])))
+}
+
+## lncRNAs and Mt_rRNAs are too long, they mostly overlap whole genes
+small_genes <- genes[genes$gene_biotype %in% c("snoRNA", "snRNA", "misc_RNA", 
+                                               "scaRNA",  "snRNA", "ribozyme", 
+                                               "miRNA", "rRNA")]
+res <- lapply(pc_genes$gene_id, function(x) {
+  gene <- pc_genes[pc_genes$gene_id == x]
+  peaks <- subsetByOverlaps(mp[["RBDm"]], gene, ignore.strand = FALSE)
+  ## with how many small RNAs are the peaks overlapping?
+  nr_olap <- countOverlaps(peaks, small_genes, ignore.strand = FALSE)
+  if(all(nr_olap > 0)){ ## all peaks overlap more than the pc genes
+    return(x)
+  } 
+  return(NULL)
+})
+olap_genes <- unique(unlist(res))
+
+gdf$gene_name[gdf$gene_id %in% olap_genes]
+```
+
+```{r}
+gdf_fixed <- gdf %>% mutate(nclus_RBDm = ifelse(gene_id %in% olap_genes, 0, nclus_RBDm))
+
+```
+
+# Hexamer motif enrichment
+
+We compute z-scores for all hexamers:
+
+$$ 
+
+z = \frac{\text{# hexamer} - \mu }{\sigma} = \frac{hexamer - mean(\text{# hexamer in shuffled peaks})}{\text{standard deviation}(\text{# hexamer in shuffled peaks})}
+
+$$
+
+where # hexamer is the hexamer count in the CLIP-seq peaks and all peaks are randomly shuffled, e.g., 100 time. Shuffling places the peak in a random location of the same region from the same gene. 
+We will use a centered window on the max peak height.
+
+```{r}
+# genome <- BSgenome.Hsapiens.UCSC.hg38
+## observed count per hexamer
+obs <- lapply(mp, function(x) {
+  seq <- getSeq(genome, x)
+  oligonucleotideFrequency(seq, width = 6, step = 1, 
+                                  simplify.as = "collapsed")
+})
+
+
+```
+
+
+# Save data
+
+```{r save-data}
+## max_cov_WT and max_covWT2 are the maximal coverage per peak in the two replicates (raw coverage)
+## merge_max_cov is the maximal coverage of the sum of two normalized replicates
+saveRDS(mp, here("Rmd", "rds", "mp.rds"))
+for(i in names(mp)){
+  write.table(mp[[i]], here("analysis", "clipper_analysis", 
+                            paste0(i, "_peak_table_merge_peaks.txt")), 
+              sep = "\t", quote = FALSE, row.names = FALSE)
+}
+```
+
+```{r sessionInfo}
+sessionInfo()
+```

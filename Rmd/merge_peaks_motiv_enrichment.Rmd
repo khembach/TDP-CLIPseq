@@ -1,0 +1,749 @@
+---
+title: "Motif enrichment"
+author: "Katharina Hembach"
+date: "03.06.2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+  
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")),
+                      warning = FALSE)
+```
+
+### Load packages
+```{r, message = FALSE}
+library(here)
+library(rtracklayer)
+library(dplyr)
+library(ggplot2)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(ggrepel)
+library(ggpubr)
+```
+
+# Load data
+
+We need the peaks of our CLIP-samples, the gene annotation of each peak and the sum of the normalized coverage of both replicates. We also require the human gene annotations and the genome sequence
+
+```{r load-data}
+gtf_file <- here("reference", "Homo_sapiens.GRCh38.98_snoDB.sorted.gtf")
+gtf <- import(gtf_file)
+genome <- BSgenome.Hsapiens.UCSC.hg38
+mp <- readRDS(here("Rmd", "rds", "mp.rds"))
+## each peak get's a number as ID
+mp <- lapply(mp, function(x){
+  x$ID <- 1:length(x)
+  x
+})
+lengths(mp)
+mp_an <- readRDS(here("Rmd", "rds", "mp_an.rds"))
+
+## peak annotation of protein coding genes
+ann_pc <- readRDS(here("Rmd", "rds", "ann_pc.rds"))
+
+## read coverage
+# cov <- readRDS(here("Rmd", "rds", "BAM_coverage.rds"))
+## sum of the two normalized coverage tracks
+cov_combined <- readRDS(here("Rmd", "rds", "cov_combined.rds"))
+```
+
+# Prepare peaks and annotation
+
+We remove all peaks with less than 6 bp.
+```{r filter-min6-peaks}
+lapply(mp, function(x) table(lengths(x) > 6))
+mp6 <- lapply(mp, function(x) x[lengths(x) > 6])
+lengths(mp6)
+## also filter the annotation table
+mp_an6 <- lapply(names(mp_an), function(x) {
+  mp_an[[x]][mp_an[[x]]$peak_id %in% mp6[[x]]$ID,]
+  })
+names(mp_an6) <- names(mp_an)
+lapply(mp_an, dim)
+lapply(mp_an6, dim)
+```
+
+We compute the peak center = region with the highest coverage or the median of the max coveraage positions if there are multiple.
+
+```{r define-peak-window-center}
+## how many peaks have more than one position with the max # reads? 
+max_peak_lengths <- lapply(names(mp6), function(x) {
+  sapply(which(cov_combined[[x]][mp6[[x]]] == 
+                 mp6[[x]]$merged_max_cov), length)})
+lapply(max_peak_lengths, table)
+
+# How far are the positions apart?
+## range of positions with max value
+a <- lapply(names(mp6), function(x) {
+  range(which(cov_combined[[x]][mp6[[x]]] == 
+                 mp6[[x]]$merged_max_cov))
+})
+lapply(a, function(x) {summary(x[,2] - x[,1])}) ## difference of positions
+
+## most regions with max coverage (3rd quartile) are not further than 
+## 7 nucleotids apart (max 144)
+## --> window of length 41 covers the max peak region in the majority of clusters
+
+## we take the median of all positions with the max coverage as the center
+for(n in names(mp6)) {
+  mp6[[n]]$peak_center <- floor(start(mp6[[n]]) +
+                median(which(cov_combined[[n]][mp6[[n]]] == 
+                               mp6[[n]]$merged_max_cov)) - 1)
+}
+```
+
+We only consider the gene annotation of the target genes per sample to avoid issues with overlapping genes. For all target genes, the sets of exonic, 3'UTR, 5'UTR and intronic regions are compiled.
+
+```{r prepare-annotation}
+# genes <- mp_an[["RBDm"]]$gene_id
+prep_an <- function(gtf, genes){
+  g <- gtf[gtf$gene_id %in% genes]
+  
+  exon <- g[g$type == "exon"] %>% unique
+  five_utr <- g[g$type == "five_prime_utr"] %>% unique
+  three_utr <- g[g$type == "three_prime_utr"] %>% unique
+
+  ## We remove all 3' and 5' UTR regions that overlap with any exons
+  exon_utr <- GenomicRanges::setdiff(exon, three_utr)
+  exon_unique <- GenomicRanges::setdiff(exon_utr, five_utr) %>% unique
+  # We remove 3'UTR regions that overlap with 5'UTR regions
+  three_utr_unique <- GenomicRanges::setdiff(three_utr, five_utr) %>% unique
+  anno <- GRangesList(exon = exon_unique, three_prime_utr = three_utr_unique, 
+             five_prime_utr = five_utr)
+  ## intron annotation
+  txdb <- makeTxDbFromGRanges(g)
+  introns <- unlist(intronsByTranscript(txdb))
+  ## remove the intronic parts that overlap with exons from other transcripts
+  anno[["intron"]] <- GenomicRanges::setdiff(introns, c(anno[["exon"]], 
+                                         anno[["three_prime_utr"]], 
+                                         anno[["five_prime_utr"]])) %>% reduce
+  ## reduce potentially overlapping ranges
+  lapply(anno, reduce)
+}
+
+sample_an <- lapply(names(mp_an6), function(n) 
+  prep_an(gtf, mp_an6[[n]]$gene_id %>% unique))
+names(sample_an) <- names(mp_an6)
+sample_an <- lapply(sample_an, function(x) 
+  lapply(x, function(i) {
+  seqlevelsStyle(i) <- "UCSC"
+  i})
+  )
+
+lapply(sample_an, function(x) lapply(x, length))
+saveRDS(sample_an, here("Rmd", "rds", "sample_an.rds"))
+```
+
+
+# Shuffled background and hexamer occurrence
+
+The annotation regions from the corresponding target genes are subset and only regions which overlap with a peak window are kept. If a window overlaps with multiple regions, we keep the 5'UTRs before the 3'UTRs before the exons before the introns.
+
+We extract the genomic sequence of each peak window. For the background sets, we randomly place the window within the filtered annotation regions (we know how many windows should be place per region) and also extract the genomic sequences. We repeat this multiple times, to generate shuffled background sets.
+We get the hexamer count by counting the occurrence of all hexamers in all windows or shuffled windows.
+
+For the z-score, we need mean hexamer count and standard deviation of the shuffled sequences. Then we can compute the z-score for each hexamer using folowing formula.
+
+$$z = \frac{\text{# hexamer} - \mu }{\sigma} = \frac{hexamer - mean(\text{# hexamer in shuffled windows})}{\text{standard deviation}(\text{# hexamer in shuffled windows})}$$
+
+where # hexamer is the hexamer count in the peak windows and all peaks are randomly shuffled, e.g., 100 time. Shuffling places the peak in a random location of the same region from the same gene. 
+
+```{r z-score-function-def}
+## for each sample
+## we place the window at a random position within each bg seq
+## we compute the hexamer counts
+## we repeat this 100 times, to generate a matrix with hexamer x 100 (hexamer count for each repetition)
+shuffled_hexamer_counts <- function(b, w_size){
+  ## only keep the region that are at least as big as w_size
+  b <- b[lengths(b) >= w_size]
+  names(b) <- 1:length(b)
+  # random number between 0 and 1 is multiplied with sequence length to determine the start position of the shuffled window
+  starts <- floor(1 + runif(length(b)) * (lengths(b)-w_size + 1))
+  # subset the sequences according to random start coordinates
+  seq <- subseq(b, start = starts, end = starts + w_size - 1)
+  of <- oligonucleotideFrequency(seq, width = 6, step = 1, 
+                                  simplify.as = "collapsed")
+}
+
+## given window size, peaks with position of peak center and overlapping annotation regions,
+## we can compute the hexamer occurrence in the peak windows
+## and we shuffle the windows in the annotation regions 100 timnes and 
+## also count the hexamers to compute the x-score per hexamer 
+hexamer_zscore <- function(wind_size = 41, mp6, sample_an){
+  half_wind <- (wind_size-1)/2
+
+  ## Peak window regions
+  wind <- lapply(mp6, function(x) 
+    GRanges(seqnames(x), IRanges(x$peak_center-half_wind, x$peak_center+half_wind), 
+            strand = strand(x), ID = x$ID))
+  
+  ## Annotation regions overlapping with at least half of a window
+  sample_an_wind <- lapply(names(sample_an), function(x) 
+    lapply(sample_an[[x]], function(a) {
+      a[queryHits(findOverlaps(a, wind[[x]], minoverlap = half_wind+1))]
+    })
+  )
+  names(sample_an_wind) <- names(sample_an)
+  
+  ## genomice sequence of windows and annotation regions
+  wind_seq <- lapply(wind, function(x) getSeq(genome, x))
+  bg_seq <- lapply(sample_an_wind, function(x) 
+    GRangesList(x) %>% 
+      unlist %>% 
+      getSeq(x = genome, names = .))
+  
+  ## hexamer count in window
+  obs <- lapply(wind_seq, function(x) {
+    oligonucleotideFrequency(x, width = 6, step = 1, 
+                                    simplify.as = "collapsed")
+  })
+  
+  ## hexamer count in shuffled windows
+  obs_sh <- lapply(names(bg_seq), function(x) {
+    obs_sh <- list()
+    for(i in 1:100){
+      obs_sh[[i]] <- shuffled_hexamer_counts(b = bg_seq[[x]], w_size = wind_size)
+    }
+    obs_sh <- bind_cols(obs_sh)
+    obs_sh
+  })
+  names(obs_sh) <- names(bg_seq)
+  
+  ## z-score
+  sh_params <- lapply(obs_sh, function(x) {
+      data.frame(mean = rowMeans(x), sd = apply(x, 1, sd))
+  })
+  
+  z_scores <- lapply(names(obs), function(x) {
+    (obs[[x]] - sh_params[[x]]$mean) / sh_params[[x]]$sd
+  })
+  names(z_scores) <- names(obs)
+  saveRDS(z_scores, here("Rmd", "rds", paste0("z_scores_wind", wind_size, ".rds")))
+  z_scores
+}
+
+## Plot the z-scores of two peak sets against each other 
+plot_hexamer <- function(dfz, xparam, yparam, i){
+  lim <- c(min(dfz[, xparam[i]], dfz[, yparam[i]]), max(dfz[, xparam[i]], dfz[, yparam[i]]))
+  p <- ggplot(dfz, aes_string(x = xparam[i], y = yparam[i], label = "hexamer")) + 
+    geom_point(alpha = 0.3, col = "darkblue") +
+    theme_bw() + xlim(lim) + ylim(lim) + theme(aspect.ratio = 1) +
+    stat_cor(method = "pearson", label.x.npc = "center", label.y.npc = "bottom") +
+    geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
+    geom_text_repel(data = rbind(dfz %>% 
+                      dplyr::arrange(desc(get(xparam[i]))) %>% 
+                      dplyr::slice(1:20),
+                      dfz %>% 
+                      dplyr::arrange(desc(get(yparam[i]))) %>% 
+                      dplyr::slice(1:20)) %>% 
+                      unique) 
+  print(p)
+}
+```
+
+
+# Z-score for different window sizes
+
+We use a centered window on the max peak height instead of the full peak sequence. We try different window sizes to check how close the potential motif is to the peak center.
+
+## window 21
+
+What are the hexamers with the highest z-score per sample?
+
+```{r wind-21, warning = FALSE, message = FALSE}
+z_scores <- hexamer_zscore(wind_size = 21, mp6, sample_an)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTGT"])
+lapply(z_scores, function(x) x["TGTGTG"])
+```
+Are the top hexamers similar between samples?
+
+### Scatterplot {.tabset}
+
+```{r z-score-plots-21, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores[[1]]), 
+                  zscore_WT = z_scores[["WT"]],
+                  zscore_6M = z_scores[["6M"]], 
+                  zscore_RBDm = z_scores[["RBDm"]])
+xparam <- c("zscore_6M", "zscore_6M", "zscore_RBDm")
+yparam <- c("zscore_WT", "zscore_RBDm", "zscore_WT")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_hexamer(dfz, xparam, yparam, i)
+  cat("\n\n")
+}
+```
+
+
+## window 41
+
+```{r wind-41, warning = FALSE, message = FALSE}
+z_scores <- hexamer_zscore(wind_size = 41, mp6, sample_an)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTGT"])
+lapply(z_scores, function(x) x["TGTGTG"])
+```
+
+### Scatterplot {.tabset}
+
+```{r z-score-plots-41, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores[[1]]), 
+                  zscore_WT = z_scores[["WT"]],
+                  zscore_6M = z_scores[["6M"]], 
+                  zscore_RBDm = z_scores[["RBDm"]])
+xparam <- c("zscore_6M", "zscore_6M", "zscore_RBDm")
+yparam <- c("zscore_WT", "zscore_RBDm", "zscore_WT")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_hexamer(dfz, xparam, yparam, i)
+  cat("\n\n")
+}
+```
+
+
+## window 61
+
+```{r wind-61, warning = FALSE, message = FALSE}
+z_scores <- hexamer_zscore(wind_size = 61, mp6, sample_an)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTGT"])
+lapply(z_scores, function(x) x["TGTGTG"])
+```
+
+### Scatterplot {.tabset}
+
+```{r z-score-plots-61, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores[[1]]), 
+                  zscore_WT = z_scores[["WT"]],
+                  zscore_6M = z_scores[["6M"]], 
+                  zscore_RBDm = z_scores[["RBDm"]])
+xparam <- c("zscore_6M", "zscore_6M", "zscore_RBDm")
+yparam <- c("zscore_WT", "zscore_RBDm", "zscore_WT")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_hexamer(dfz, xparam, yparam, i)
+  cat("\n\n")
+}
+```
+
+
+## window 81
+
+```{r wind-81, warning = FALSE, message = FALSE}
+z_scores <- hexamer_zscore(wind_size = 81, mp6, sample_an)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTGT"])
+lapply(z_scores, function(x) x["TGTGTG"])
+```
+
+### Scatterplot {.tabset}
+
+```{r z-score-plots-81, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores[[1]]), 
+                  zscore_WT = z_scores[["WT"]],
+                  zscore_6M = z_scores[["6M"]], 
+                  zscore_RBDm = z_scores[["RBDm"]])
+xparam <- c("zscore_6M", "zscore_6M", "zscore_RBDm")
+yparam <- c("zscore_WT", "zscore_RBDm", "zscore_WT")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_hexamer(dfz, xparam, yparam, i)
+  cat("\n\n")
+}
+```
+
+
+# Peaks split by location
+
+We separate the protein coding and spliced lncRNAs from the noncoding RNAs and compare the hexamers enrichment in introns, exons and UTRs.
+We focus on the WT sample, because we first want to discover the known GU-repeat motif of intronic targets.
+
+```{r separate-pc-ncRNA}
+## we get the gene IDs for each of the subsets and prepare gene annotations for each of the sets.
+
+##seperate protein coding and long lncRNAs from the rest
+g <- gtf[gtf$gene_id %in% mp_an6[["WT"]]$gene_id & gtf$type == "gene"]
+pc <- g[g$gene_biotype == "protein_coding"]$gene_id
+length(pc)
+## separate spliced from unspliced lncRNAs
+lnc <- g[g$gene_biotype == "lncRNA"]$gene_id
+length(lnc)
+g1 <- gtf[gtf$gene_id %in% lnc]
+e <- g1[g1$type == "exon"]
+sp <- split(e$exon_number, e$gene_id)
+## all lncRNAs with more than 1 exon
+lnc_spl <- names(sp)[lengths(lapply(sp, unique)) > 1]
+length(lnc_spl)
+## all spliced genes, that need to be checked for potential false positives
+pc <- c(pc, g[g$gene_id %in% lnc_spl]$gene_id)
+length(pc)
+## short RNAs
+short <- mp_an6[["WT"]]$gene_id[!mp_an6[["WT"]]$gene_id %in% pc] %>% unique
+length(short)
+
+length(short) + length(pc)
+length(unique(mp_an6[["WT"]]$gene_id))
+```
+
+
+We prepare the annotation for the two gene sets
+
+```{r prep-ann-split}
+sample_an_pc <- prep_an(gtf, pc)
+sample_an_pc <- lapply(sample_an_pc, function(x){seqlevelsStyle(x) <- "UCSC"; x})
+sample_an_nc <- prep_an(gtf, short)
+sample_an_nc <- lapply(sample_an_nc, function(x){seqlevelsStyle(x) <- "UCSC"; x})
+sample_an_nc <- sample_an_nc[sapply(sample_an_nc, function(x) length(x) > 0)]
+```
+
+
+## window 81
+
+```{r wind-81-pc-nc, warning = FALSE, message = FALSE}
+hexamer_zscore_single_set <- function(wind_size = 41, mp6, sample_an){
+  half_wind <- (wind_size-1)/2
+
+  ## Peak window regions
+  wind <- GRanges(seqnames(mp6), 
+                  IRanges(mp6$peak_center-half_wind, mp6$peak_center+half_wind), 
+                  strand = strand(mp6), ID = mp6$ID)
+  
+  ## Annotation regions overlapping with at least half of a window
+  sample_an_wind <- lapply(sample_an, function(a) {
+    a[queryHits(findOverlaps(a, wind, minoverlap = half_wind+1))]
+    })  # names(sample_an_wind) <- names(sample_an)
+  
+  ## genomice sequence of windows and annotation regions
+  wind_seq <- getSeq(genome, wind)
+  bg_seq <- sample_an_wind %>% 
+    GRangesList() %>% 
+    unlist %>% 
+    getSeq(x = genome, names = .)
+  
+  ## hexamer count in window
+  obs <- oligonucleotideFrequency(wind_seq, width = 6, step = 1, 
+                                    simplify.as = "collapsed")
+  
+  ## hexamer count in shuffled windows
+  obs_sh <- list()
+  for(i in 1:100){
+    obs_sh[[i]] <- shuffled_hexamer_counts(b = bg_seq, w_size = wind_size)
+  }
+  obs_sh <- bind_cols(obs_sh)
+  
+  ## z-score
+  sh_params <- data.frame(mean = rowMeans(obs_sh), sd = apply(obs_sh, 1, sd))
+
+  (obs - sh_params$mean) / sh_params$sd
+}
+
+# separate pc from short genes
+peak_ids_pc <- mp_an6[["WT"]]$peak_id[mp_an6[["WT"]]$gene_id %in% pc]
+peak_ids_nc <- mp_an6[["WT"]]$peak_id[mp_an6[["WT"]]$gene_id %in% short]
+
+## protein coding and spliced  lncRNAs
+z_scores_pc <- hexamer_zscore_single_set(wind_size = 81, 
+                           mp6[["WT"]][mp6[["WT"]]$ID %in% peak_ids_pc],
+                           sample_an_pc)
+summary(z_scores_pc)
+z_scores_pc[order(z_scores_pc)][1:20]
+z_scores_pc[order(z_scores_pc, decreasing = TRUE)][1:30]
+z_scores_pc["GTGTGT"]
+z_scores_pc["TGTGTG"]
+
+## protein coding and spliced  lncRNAs
+z_scores_nc <- hexamer_zscore_single_set(wind_size = 81, 
+                           mp6[["WT"]][mp6[["WT"]]$ID %in% peak_ids_nc],
+                           sample_an_nc)
+summary(z_scores_nc)
+z_scores_nc[order(z_scores_nc)][1:20]
+z_scores_nc[order(z_scores_nc, decreasing = TRUE)][1:30]
+z_scores_nc["GTGTGT"]
+z_scores_nc["TGTGTG"]
+```
+
+
+### Split peak location within pc gene
+
+
+```{r split-pc-peaks-location-81, message = FALSE}
+hexamer_zscore_split <- function(wind_size = 41, mp6, sample_an){
+  half_wind <- (wind_size-1)/2
+
+  ## Peak window regions
+  wind <- lapply(mp6, function(x) 
+    GRanges(seqnames(x), IRanges(x$peak_center-half_wind, x$peak_center+half_wind), 
+            strand = strand(x), ID = x$ID))
+  
+  ## Annotation regions overlapping with at least half of a window
+  sample_an_wind <- lapply(names(sample_an), function(x) {
+      sample_an[[x]][queryHits(findOverlaps(sample_an[[x]], 
+                                            wind[[x]], 
+                                            minoverlap = half_wind+1))]
+    })
+  names(sample_an_wind) <- names(sample_an)
+  
+  ## genomice sequence of windows and annotation regions
+  wind_seq <- lapply(wind, function(x) getSeq(genome, x))
+  bg_seq <- lapply(sample_an_wind, function(x) 
+    GRangesList(x) %>% 
+      unlist %>% 
+      getSeq(x = genome, names = .))
+  
+  ## hexamer count in window
+  obs <- lapply(wind_seq, function(x) {
+    oligonucleotideFrequency(x, width = 6, step = 1, 
+                                    simplify.as = "collapsed")
+  })
+  
+  ## hexamer count in shuffled windows
+  obs_sh <- lapply(names(bg_seq), function(x) {
+    obs_sh <- list()
+    for(i in 1:100){
+      obs_sh[[i]] <- shuffled_hexamer_counts(b = bg_seq[[x]], w_size = wind_size)
+    }
+    obs_sh <- bind_cols(obs_sh)
+    obs_sh
+  })
+  names(obs_sh) <- names(bg_seq)
+  
+  ## z-score
+  sh_params <- lapply(obs_sh, function(x) {
+      data.frame(mean = rowMeans(x), sd = apply(x, 1, sd))
+  })
+  
+  z_scores <- lapply(names(obs), function(x) {
+    (obs[[x]] - sh_params[[x]]$mean) / sh_params[[x]]$sd
+  })
+  names(z_scores) <- names(obs)
+  z_scores
+}
+
+peaks_split_pc <- lapply(sample_an_pc, function(a){
+  subsetByOverlaps(mp6[["WT"]][mp6[["WT"]]$ID %in% peak_ids_pc], a, minoverlap = 41)
+})
+lapply(peaks_split_pc, length)
+
+z_scores_pc_split <- hexamer_zscore_split(wind_size = 81, peaks_split_pc, sample_an_pc)
+lapply(z_scores_pc_split, summary)
+lapply(z_scores_pc_split, function(x) x[order(x)][1:20])
+lapply(z_scores_pc_split, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores_pc_split, function(x) x["GTGTGT"])
+lapply(z_scores_pc_split, function(x) x["TGTGTG"])
+```
+
+
+#### Scatterplot {.tabset}
+
+```{r z-score-plots-split-pc, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores_pc_split[[1]]), 
+                  zscore_exon = z_scores_pc_split[["exon"]],
+                  zscore_3UTR = z_scores_pc_split[["three_prime_utr"]], 
+                  zscore_5UTR = z_scores_pc_split[["five_prime_utr"]],
+                  zscore_intron = z_scores_pc_split[["intron"]])
+
+xparam <- c("zscore_exon", "zscore_3UTR", "zscore_5UTR", "zscore_exon", "zscore_exon", "zscore_3UTR")
+yparam <- c("zscore_intron", "zscore_intron", "zscore_intron", "zscore_3UTR", "zscore_5UTR", "zscore_5UTR")
+
+for(i in 1:length(xparam)){
+  cat("##### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_hexamer(dfz, xparam, yparam, i)
+  cat("\n\n")
+}
+```
+
+
+## window 41
+
+```{r z-score-split-pc-41, message = FALSE}
+peaks_split_pc <- lapply(sample_an_pc, function(a){
+  subsetByOverlaps(mp6[["WT"]][mp6[["WT"]]$ID %in% peak_ids_pc], a, minoverlap = 21)
+})
+lapply(peaks_split_pc, length)
+
+z_scores_pc_split <- hexamer_zscore_split(wind_size = 41, peaks_split_pc, sample_an_pc)
+lapply(z_scores_pc_split, summary)
+lapply(z_scores_pc_split, function(x) x[order(x)][1:20])
+lapply(z_scores_pc_split, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores_pc_split, function(x) x["GTGTGT"])
+lapply(z_scores_pc_split, function(x) x["TGTGTG"])
+```
+
+
+### Scatterplot {.tabset}
+
+```{r z-score-plots-split-pc-41, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores_pc_split[[1]]), 
+                  zscore_exon = z_scores_pc_split[["exon"]],
+                  zscore_3UTR = z_scores_pc_split[["three_prime_utr"]], 
+                  zscore_5UTR = z_scores_pc_split[["five_prime_utr"]],
+                  zscore_intron = z_scores_pc_split[["intron"]])
+xparam <- c("zscore_exon", "zscore_3UTR", "zscore_5UTR", "zscore_exon", "zscore_exon", "zscore_3UTR")
+yparam <- c("zscore_intron", "zscore_intron", "zscore_intron", "zscore_3UTR", "zscore_5UTR", "zscore_5UTR")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_hexamer(dfz, xparam, yparam, i)
+  cat("\n\n")
+}
+```
+
+
+## Full peak regions
+
+Instead of centering a window, we keep the original peak size.
+
+```{r split-pc-frac}
+## a peak overlaps a region if more than 50% of the peak overlap
+
+## subset query if it overlaps with more than frac with a range in subject
+## if the subject hits are returned, the full set is returned, i.e. one region per query
+subsetByOverlaps_frac <- function(query, subject, frac, return = "query"){
+  hits <- findOverlaps(query, subject)
+  # Compute percent overlap and filter the hits:
+  overlaps <- pintersect(query[queryHits(hits)], subject[subjectHits(hits)])
+  percentOverlap <- width(overlaps) / width(query[queryHits(hits)])
+  hits <- hits[percentOverlap > frac]
+  if(return == "query") {
+    query[queryHits(hits) %>% unique]
+  } else if (return == "subject"){
+    subject[subjectHits(hits)]
+  }
+}
+
+peaks_split_frac <- lapply(sample_an_pc, function(a){
+  p <- mp6[["WT"]][mp6[["WT"]]$ID %in% peak_ids_pc]
+  subsetByOverlaps_frac(p, a, frac = 0.5)
+})
+lapply(peaks_split_frac, length)
+```
+
+
+We now compute the hexamer counts for the whole peak sequences and the shuffled background peaks.
+
+```{r z-score-split-pc-frac, message = FALSE}
+hexamer_zscore_split_full <- function(mp6, sample_an){
+  ## all peaks overlap an annotated region with > 50%
+  ## we need the overlapping region per peak
+  sample_an_frac <- lapply(names(mp6), function(x) {
+    subsetByOverlaps_frac(mp6[[x]], subject = sample_an[[x]], 
+                          frac = 0.5, return = "subject")
+  })
+  names(sample_an_frac) <- names(mp6)
+ 
+  ## genomic sequence of peak and annotation regions
+  peak_seq <- lapply(mp6, function(x) getSeq(genome, x))
+  bg_seq <- lapply(sample_an_frac, function(x) 
+    GRangesList(x) %>% 
+      unlist %>% 
+      getSeq(x = genome, names = .))
+  
+  ## hexamer count in window
+  obs <- lapply(peak_seq, function(x) {
+    oligonucleotideFrequency(x, width = 6, step = 1, 
+                                    simplify.as = "collapsed")
+  })
+  
+  ## hexamer count in shuffled peaks
+  obs_sh <- lapply(names(bg_seq), function(x) {
+    obs_sh <- list()
+    for(i in 1:100){
+      obs_sh[[i]] <- 
+        shuffled_hexamer_counts(b = bg_seq[[x]], 
+                                w_size = ceiling(lengths(peak_seq[[x]])/2))
+    }
+    bind_cols(obs_sh)
+  })
+  names(obs_sh) <- names(bg_seq)
+  
+  ## z-score
+  sh_params <- lapply(obs_sh, function(x) {
+      data.frame(mean = rowMeans(x), sd = apply(x, 1, sd))
+  })
+  
+  z_scores <- lapply(names(obs), function(x) {
+    (obs[[x]] - sh_params[[x]]$mean) / sh_params[[x]]$sd
+  })
+  names(z_scores) <- names(obs)
+  z_scores
+}
+
+z_scores_pc_split_full <- hexamer_zscore_split_full(peaks_split_frac, sample_an_pc)
+lapply(z_scores_pc_split_full, summary)
+lapply(z_scores_pc_split_full, function(x) x[order(x)][1:20])
+lapply(z_scores_pc_split_full, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores_pc_split_full, function(x) x["GTGTGT"])
+lapply(z_scores_pc_split_full, function(x) x["TGTGTG"])
+```
+
+
+### Scatterplot {.tabset}
+
+```{r z-score-plots-pc-full, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores_pc_split_full[[1]]), 
+                  zscore_exon = z_scores_pc_split_full[["exon"]],
+                  zscore_3UTR = z_scores_pc_split_full[["three_prime_utr"]], 
+                  zscore_5UTR = z_scores_pc_split_full[["five_prime_utr"]],
+                  zscore_intron = z_scores_pc_split_full[["intron"]])
+xparam <- c("zscore_exon", "zscore_3UTR", "zscore_5UTR", "zscore_exon", "zscore_exon", "zscore_3UTR")
+yparam <- c("zscore_intron", "zscore_intron", "zscore_intron", "zscore_3UTR", "zscore_5UTR", "zscore_5UTR")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_hexamer(dfz, xparam, yparam, i)
+  cat("\n\n")
+}
+```
+
+
+## ncRNAs full peaks
+
+```{r z-score-split-nc-frac, message = FALSE}
+peaks_split_frac_nc <- lapply(sample_an_nc, function(a){
+  p <- mp6[["WT"]][mp6[["WT"]]$ID %in% peak_ids_nc]
+  subsetByOverlaps_frac(p, a, frac = 0.5)
+})
+peaks_split_frac_nc <- peaks_split_frac_nc[sapply(peaks_split_frac_nc, 
+                                                  function(x) length(x) > 0)]
+lapply(peaks_split_frac_nc, length)
+
+z_scores_nc_split_full <- hexamer_zscore_split_full(peaks_split_frac_nc, sample_an_nc)
+lapply(z_scores_nc_split_full, summary)
+lapply(z_scores_nc_split_full, function(x) x[order(x)][1:20])
+lapply(z_scores_nc_split_full, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores_nc_split_full, function(x) x["GTGTGT"])
+lapply(z_scores_nc_split_full, function(x) x["TGTGTG"])
+```
+
+### Scatterplot {.tabset}
+
+```{r z-score-plots-nc-full, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores_nc_split_full[[1]]), 
+                  zscore_exon = z_scores_nc_split_full[["exon"]],
+                  zscore_intron = z_scores_nc_split_full[["intron"]])
+xparam <- "zscore_exon"
+yparam <- "zscore_intron"
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_hexamer(dfz, xparam, yparam, i)
+  cat("\n\n")
+}
+```
