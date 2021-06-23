@@ -1,0 +1,69 @@
+merge_peaks installation
+
+## cwl
+pip install cwl
+
+## IDR
+wget https://github.com/nboley/idr/archive/2.0.3.zip
+unzip 2.0.3.zip
+cd 2.0.3/
+## adjust line 63 and 64 in idr.py to None, because our BED files only have 6 columns
+
+## install dependdecies in conda environment
+conda install numpy
+
+python3 setup.py install
+
+## check installation with
+idr --help
+
+## install perl dependencies
+cpan install Statistics::Basic
+cpan install Statistics::Distributions
+cpan install Statistics::R
+
+## install cwl and cwltool
+pip install cwl
+conda install -c conda-forge cwltool
+
+## install node
+echo 'export PATH=$HOME/local/bin:$PATH' >> ~/.bashrc
+. ~/.bashrc
+mkdir ~/local
+mkdir ~/node-latest-install
+cd ~/node-latest-install
+wget http://nodejs.org/dist/node-latest.tar.gz
+tar xz -f node-latest.tar.gz
+cd node-latest
+## curl http://nodejs.org/dist/node-latest.tar.gz | tar xz --strip-components=1
+./configure --prefix=~/local
+make install # ok, fine, this step probably takes more than 30 seconds...
+# curl https://www.npmjs.org/install.sh | sh
+
+## install samtools
+conda install -c bioconda samtools 
+
+## clone meerge_peaks repo and add subdirectories to $PATH
+PATH=$PATH:/home/kathi/software/merge_peaks/cwl/:/home/kathi/software/merge_peaks/bin/:/home/kathi/software/merge_peaks/bin/perl/:/home/kathi/software/merge_peaks/wf/
+
+## adjust yaml file with BAM and peak files
+## run pipeline with 
+
+
+## remove all docker requirements from following cwl files (the software is installed locally)
+## bam_split.cwl
+## bams_merge.cwl
+## calculate_readnum.cwl
+## samtools_index.cwl
+## clipper.cwl
+## overlap+peakfi_with_bam.cwl
+
+## comment out hard-coded perl library location in 
+## overlap_peakfi_with_bam.pl
+## add per library with local installation to PERL5LIB variable in .bashrc
+export PERL5LIB=/home/kathi/perl5/lib/perl5/
+
+## fix bed_to_narrowpeak.py line 74, remove second :
+
+## Run workflow without docker containers
+./merge_peaks_2inputs.yaml --no-container
