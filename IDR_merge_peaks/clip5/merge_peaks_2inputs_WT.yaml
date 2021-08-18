@@ -1,0 +1,28 @@
+#!/usr/bin/env eCLIP_full_IDR_pipeline_2inputs_scatter_singleNode
+
+species: GRCh38_fixed
+samples:
+  - 
+    - name: "WT"
+      ip_bam: 
+        class: File
+        path: /home/kathi/Manu_TDP_CLIP/output/BAM_deduplicated_clip5/20200123.A-WT_R2_deduplicated.ucsc.bam
+      input_bam:
+        class: File
+        path: /home/kathi/Manu_TDP_CLIP/output_riboZero/BAM_deduplicated/WT1_200219_L1-2_deduplicated.r2.bam
+      peak_clusters:
+        class: File
+        path: /home/kathi/Manu_TDP_CLIP/output/clipper_clip5/20200123.A-WT_R2_deduplicated.ucsc.clipper_peaks.bed
+    - name: "WT2"
+      ip_bam: 
+        class: File
+        path: /home/kathi/Manu_TDP_CLIP/output/BAM_deduplicated_clip5/20200123.A-WT2_R2_deduplicated.ucsc.bam
+      input_bam:
+        class: File
+        path: /home/kathi/Manu_TDP_CLIP/output_riboZero/BAM_deduplicated/WT2_200219_L1-2_deduplicated.r2.bam
+      peak_clusters:
+        class: File
+        path: /home/kathi/Manu_TDP_CLIP/output/clipper_clip5/20200123.A-WT2_R2_deduplicated.ucsc.clipper_peaks.bed
+chrom_sizes:
+  class: File
+  path: /home/kathi/Manu_TDP_CLIP/reference/hg38.chrom.sizes.txt
