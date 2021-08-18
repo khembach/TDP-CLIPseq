@@ -34,7 +34,9 @@ STARindex: reference/STARIndex/Homo_sapiens.GRCh38.98.STAR.idx
 ##--------------------------------------------------------------------------------------------
 ## Add or remove parameters inside the ""
 additional_star_index: ""
-additional_star_align: "--outFilterMultimapNmax 1 --outFilterMismatchNmax 4 --outReadsUnmapped Fastx --outSAMattributes All --alignEndsType EndToEnd --outFilterType BySJout --outFilterScoreMin 10 --outSAMmode Full"
+additional_star_align: "--outFilterMultimapNmax 1 --outFilterMismatchNmax 2  --outSAMattributes All  --alignEndsType EndToEnd --outFilterType BySJout --outFilterScoreMin 10 --outSAMmode Full"
+# remove EndTo Endd requirement: --alignEndsType EndToEnd
+# --outFilterScoreMin 10 --outReadsUnmapped Fastx"
 ## these parameters are inspired by the eCLIP pipeline from ENCODE https://www.encodeproject.org/documents/739ca190-8d43-4a68-90ce-1a0ddfffc6fd/@@download/attachment/eCLIP_analysisSOP_v2.2.pdf
 additional_star_align_2nd_round: "--outFilterMultimapNmax 1 --outFilterMismatchNmax 4 --outSAMattributes All --alignEndsType EndToEnd --outFilterType BySJout --outFilterScoreMin 10 --outSAMmode Full"
 
@@ -75,6 +77,8 @@ fqsuffix: fastq
 ## To put output in the current directory, set output to ".".
 ##---------------------------------------------------------------------------------------------
 output: output
+star_output: STAR_clip5
+dedup_output: BAM_deduplicated_clip5
 ##---------------------------------------------------------------------------------------------
 
 ## R setup
@@ -94,7 +98,7 @@ run_STAR: True
 ##---------------------------------------------------------------------------------------------
 
 ## CLIPper results
-clipper: "clipper"
+clipper: "clipper_clip5"
 bigwig: "bigwig"
 
 ## sf from Rmd/clipper_analysis.html

@@ -23,7 +23,7 @@ config['gtf'] = sanitizefile(config['gtf'])
 config['genome'] = sanitizefile(config['genome'])
 config['STARindex'] = sanitizefile(config['STARindex'])
 config['metatxt'] = sanitizefile(config['metatxt'])
-config['salmonindex'] = sanitizefile(config['salmonindex'])
+#config['salmonindex'] = sanitizefile(config['salmonindex'])
 
 ## Read metadata
 if not os.path.isfile(config["metatxt"]):
@@ -109,15 +109,44 @@ rule runtrimming:
 		expand(os.path.join(outputdir, "FastQC", "".join(["{sample}_", str(config["fqext2"]), "_val_2_fastqc.zip"])), sample = samples.names[samples.type == 'PE'].values.tolist()),
 		expand(os.path.join(outputdir, "FastQC", "{sample}_trimmed_fastqc.zip"), sample = samples.names[samples.type == 'SE'].values.tolist())
 
+
+## remove first 5 bases from each read
+rule run_clip5:
+	input:
+		expand(os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq_clip5_sorted.gz"])), sample = samples.names[samples.type == 'PE'].values.tolist()),
+		fastq2 = expand(os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq_clip5_sorted.gz"])), sample = samples.names[samples.type == 'PE'].values.tolist())
+
 ## STAR alignment
 rule runstar:
 	input:
-		expand(os.path.join(outputdir, "STAR", "{sample}", "{sample}_Aligned.sortedByCoord.out.bam.bai"), sample = samples.names.values.tolist()),
-		expand(os.path.join(outputdir, "STARbigwig", "{sample}_Aligned.sortedByCoord.out.bw"), sample = samples.names.values.tolist())
+		expand(os.path.join(outputdir, config["star_output"], "{sample}", "{sample}_Aligned.sortedByCoord.out.bam.bai"), sample = samples.names.values.tolist())
+		# ,expand(os.path.join(outputdir, "STARbigwig", "{sample}_Aligned.sortedByCoord.out.bw"), sample = samples.names.values.tolist())
+
+rule runstar_clip5:
+	input:
+		expand(os.path.join(outputdir, "STAR_clip5", "{sample}", "{sample}_Aligned.sortedByCoord.out.bam.bai"), sample = samples.names.values.tolist())
+
+
+rule runstar_clip5_separate:
+	input:
+		expand(os.path.join(outputdir, "STAR_clip5", "{sample}", "{sample}_R1_Aligned.sortedByCoord.out.bam"), sample = samples.names.values.tolist()),
+		expand(os.path.join(outputdir, "STAR_clip5", "{sample}", "{sample}_R2_Aligned.sortedByCoord.out.bam"), sample = samples.names.values.tolist())
+
+
+rule runstar_clip5_R2:
+	input:
+		expand(os.path.join(outputdir, config["star_output"], "{sample}", "{sample}_R2_Aligned.sortedByCoord.out.bam.bai"), sample = samples.names.values.tolist())
+
 
 rule run_removedup:
 	input:
-		expand(os.path.join(outputdir, "BAM_deduplicated", "{sample}_deduplicated.bam.bai"), sample = samples.names.values.tolist())
+		expand(os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.bam.bai"), sample = samples.names.values.tolist())
+
+rule run_removedup_clip5_R2:
+	input:
+		expand(os.path.join(outputdir, config["dedup_output"], "{sample}_R2_deduplicated.bam.bai"), sample = samples.names.values.tolist())
+
+
 
 rule run_filter_second_read:
 	input:
@@ -125,8 +154,15 @@ rule run_filter_second_read:
 
 rule run_clipper:
 	input:
-		expand(os.path.join(outputdir, "BAM_deduplicated/{sample}_deduplicated.r2.ucsc.bam.bai"), sample = samples.names.values.tolist()),
+		expand(os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.r2.ucsc.bam.bai"), sample = samples.names.values.tolist()),
 		expand(os.path.join(outputdir, config["clipper"], "{sample}_deduplicated.r2.ucsc.clipper_peaks.bed"), sample = samples.names.values.tolist())
+
+rule run_clipper_clip5_R2:
+	input:
+		expand(os.path.join(outputdir, config["dedup_output"], "{sample}_R2_deduplicated.ucsc.bam.bai"), sample = samples.names.values.tolist()),
+		expand(os.path.join(outputdir, config["clipper"], "{sample}_R2_deduplicated.ucsc.clipper_peaks.bed"), sample = samples.names.values.tolist())
+
+
 
 rule run_norm_bigwig:
 	input:
@@ -201,57 +237,57 @@ rule starindex:
 		"--genomeFastaFiles {input.genome} --sjdbGTFfile {input.gtf} --sjdbOverhang {params.readlength} "
 		"{params.starextraparams}"
 
-## Generate Salmon index from merged cDNA and ncRNA files
-rule salmonindex:
-	input:
-		txome = config["txome"]
-	output:
-		os.path.join(config["salmonindex"], "versionInfo.json")
-	log:
-		os.path.join(outputdir, "logs", "salmon_index.log")
-	benchmark:
-		os.path.join(outputdir, "benchmarks", "salmon_index.txt")
-	params:
-		salmonoutdir = lambda wildcards, output: os.path.dirname(output[0]),   ## dirname of first output
-		anno = config["annotation"],
-		salmonextraparams = config["additional_salmon_index"]
-	conda:
-		"envs/environment.yaml"
-	shell:
-	  """
-	  if [ {params.anno} == "Gencode" ]; then
-      echo 'Salmon version:\n' > {log}; salmon --version >> {log};
-  	  salmon index -t {input.txome} -i {params.salmonoutdir} --gencode {params.salmonextraparams}
-    else
-  	  echo 'Salmon version:\n' > {log}; salmon --version >> {log};
-      salmon index -t {input.txome} -i {params.salmonoutdir} {params.salmonextraparams}
-    fi
-    """
+# ## Generate Salmon index from merged cDNA and ncRNA files
+# rule salmonindex:
+# 	input:
+# 		txome = config["txome"]
+# 	output:
+# 		os.path.join(config["salmonindex"], "versionInfo.json")
+# 	log:
+# 		os.path.join(outputdir, "logs", "salmon_index.log")
+# 	benchmark:
+# 		os.path.join(outputdir, "benchmarks", "salmon_index.txt")
+# 	params:
+# 		salmonoutdir = lambda wildcards, output: os.path.dirname(output[0]),   ## dirname of first output
+# 		anno = config["annotation"],
+# 		salmonextraparams = config["additional_salmon_index"]
+# 	conda:
+# 		"envs/environment.yaml"
+# 	shell:
+# 	  """
+# 	  if [ {params.anno} == "Gencode" ]; then
+#       echo 'Salmon version:\n' > {log}; salmon --version >> {log};
+#   	  salmon index -t {input.txome} -i {params.salmonoutdir} --gencode {params.salmonextraparams}
+#     else
+#   	  echo 'Salmon version:\n' > {log}; salmon --version >> {log};
+#       salmon index -t {input.txome} -i {params.salmonoutdir} {params.salmonextraparams}
+#     fi
+#     """
 
-## Generate linkedtxome mapping
-rule linkedtxome:
-	input:
-		txome = config["txome"],
-		gtf = config["gtf"],
-		salmonidx = os.path.join(config["salmonindex"], "versionInfo.json"),
-		script = "scripts/generate_linkedtxome.R",
-		install = os.path.join(outputdir, "Rout", "pkginstall_state.txt")
-	log:
-		os.path.join(outputdir, "Rout", "generate_linkedtxome.Rout")
-	benchmark:
-		os.path.join(outputdir, "benchmarks", "generate_linkedtxome.txt")
-	output:
-		"".join([config["salmonindex"], ".json"])
-	params:
-		flag = config["annotation"],
-		organism = config["organism"],
-		release = str(config["release"]),
-		build = config["build"],
-		Rbin = Rbin
-	conda:
-		Renv
-	shell:
-		'''{params.Rbin} CMD BATCH --no-restore --no-save "--args transcriptfasta='{input.txome}' salmonidx='{input.salmonidx}' gtf='{input.gtf}' annotation='{params.flag}' organism='{params.organism}' release='{params.release}' build='{params.build}' output='{output}'" {input.script} {log}'''
+# ## Generate linkedtxome mapping
+# rule linkedtxome:
+# 	input:
+# 		txome = config["txome"],
+# 		gtf = config["gtf"],
+# 		salmonidx = os.path.join(config["salmonindex"], "versionInfo.json"),
+# 		script = "scripts/generate_linkedtxome.R",
+# 		install = os.path.join(outputdir, "Rout", "pkginstall_state.txt")
+# 	log:
+# 		os.path.join(outputdir, "Rout", "generate_linkedtxome.Rout")
+# 	benchmark:
+# 		os.path.join(outputdir, "benchmarks", "generate_linkedtxome.txt")
+# 	output:
+# 		"".join([config["salmonindex"], ".json"])
+# 	params:
+# 		flag = config["annotation"],
+# 		organism = config["organism"],
+# 		release = str(config["release"]),
+# 		build = config["build"],
+# 		Rbin = Rbin
+# 	conda:
+# 		Renv
+# 	shell:
+# 		'''{params.Rbin} CMD BATCH --no-restore --no-save "--args transcriptfasta='{input.txome}' salmonidx='{input.salmonidx}' gtf='{input.gtf}' annotation='{params.flag}' organism='{params.organism}' release='{params.release}' build='{params.build}' output='{output}'" {input.script} {log}'''
 
 
 ## ------------------------------------------------------------------------------------ ##
@@ -390,6 +426,8 @@ rule trimgalorePE:
 		"trim_galore -q 20 --phred33 --length 20 -o {params.FASTQtrimmeddir} --path_to_cutadapt cutadapt "
 		"--paired {input.fastq1} {input.fastq2}"
 
+
+
 ## second round of adapter trimming to remove duplicate adapter ligation events
 ## we specify the TruSeq adapters taken from https://emea.support.illumina.com/bulletins/2016/12/what-sequences-do-i-use-for-adapter-trimming.html
 # --adapter AGATCGGAAGAGCACACGTCTGAACTCCAGTCA --adapter2 AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT
@@ -414,123 +452,141 @@ rule trimgalorePE_2nd_round:
 		"--paired {input.fastq1} {input.fastq2} --illumina"
 
 
-## ------------------------------------------------------------------------------------ ##
-## Salmon abundance estimation
-## ------------------------------------------------------------------------------------ ##
-# Estimate abundances with Salmon
-rule salmonSE:
+## we remove the first 5 bases from R1 and R2 because they are enriched for Gs and Cs
+rule cutadapt_clip5:
 	input:
-		index = os.path.join(config["salmonindex"], "versionInfo.json"),
-		fastq = os.path.join(outputdir, "FASTQtrimmed", "{sample}_trimmed.fq.gz") if config["run_trimming"] else os.path.join(FASTQdir, "".join(["{sample}.", str(config["fqsuffix"]), ".gz"]))
+		fastq1 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq.gz"])),
+		fastq2 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq.gz"]))
 	output:
-		os.path.join(outputdir, "salmon", "{sample}", "quant.sf")
-	log:
-		os.path.join(outputdir, "logs", "salmon_{sample}.log")
-	benchmark:
-		os.path.join(outputdir, "benchmarks", "salmon_{sample}.txt")
-	threads:
-		config["ncores"]
+		fastq1 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq_clip5.gz"])),
+		fastq2 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq_clip5.gz"]))
 	params:
-		salmonindex = lambda wildcards, input: os.path.dirname(input['index']),   ## dirname of index input
-		salmondir = lambda wildcards, output: os.path.dirname(os.path.dirname(output[0])),   ## dirname of first output
-		salmonextraparams = config["additional_salmon_quant"]
+		FASTQtrimmeddir = lambda wildcards, output: os.path.dirname(output[0])   ## dirname of first output
+	log:
+		os.path.join(outputdir, "logs", "cutadapt_clip5_{sample}.log")
+	benchmark:
+		os.path.join(outputdir, "benchmarks", "cutadapt_clip5_{sample}.txt")
 	conda:
 		"envs/environment.yaml"
-	shell:
-		"echo 'Salmon version:\n' > {log}; salmon --version >> {log}; "
-		"salmon quant -i {params.salmonindex} -l A -r {input.fastq} "
-		"-o {params.salmondir}/{wildcards.sample} -p {threads} {params.salmonextraparams}"
-
-rule salmonPE:
-	input:
-		index = os.path.join(config["salmonindex"], "versionInfo.json"),
-		fastq1 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq.gz"])) if config["run_trimming"] else os.path.join(FASTQdir, "".join(["{sample}_", str(config["fqext1"]), ".", str(config["fqsuffix"]), ".gz"])),
-		fastq2 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq.gz"])) if config["run_trimming"] else os.path.join(FASTQdir, "".join(["{sample}_", str(config["fqext2"]), ".", str(config["fqsuffix"]), ".gz"]))
-	output:
-		os.path.join(outputdir, "salmon", "{sample}", "quant.sf")
-	log:
-		os.path.join(outputdir, "logs", "salmon_{sample}.log")
-	benchmark:
-		os.path.join(outputdir, "benchmarks", "salmon_{sample}.txt")
 	threads:
 		config["ncores"]
-	params:
-		salmonindex = lambda wildcards, input: os.path.dirname(input['index']),   ## dirname of index input
-		salmondir = lambda wildcards, output: os.path.dirname(os.path.dirname(output[0])),   ## dirname of first output
-		salmonextraparams = config["additional_salmon_quant"]
-	conda:
-		"envs/environment.yaml"
 	shell:
-		"echo 'Salmon version:\n' > {log}; salmon --version >> {log}; "
-		"salmon quant -i {params.salmonindex} -l A -1 {input.fastq1} -2 {input.fastq2} "
-		"-o {params.salmondir}/{wildcards.sample} -p {threads} {params.salmonextraparams}"
+		"echo 'cutadapt version:\n' > {log}; cutadapt --version >> {log}; "
+		"cutadapt -u 5 -U 5 -j {threads} -o {output.fastq1} -p {output.fastq2} {input.fastq1} {input.fastq2}"
 
 
-## ------------------------------------------------------------------------------------ ##
-## Transcript quantification
-## ------------------------------------------------------------------------------------ ##
-## tximeta
-rule tximeta:
+
+rule sort_fastq_clip5:
 	input:
-	    os.path.join(outputdir, "Rout", "pkginstall_state.txt"),
-		expand(os.path.join(outputdir, "salmon", "{sample}", "quant.sf"), sample = samples.names.values.tolist()),
-		metatxt = config["metatxt"],
-		salmonidx = os.path.join(config["salmonindex"], "versionInfo.json"),
-		json = "".join([config["salmonindex"], ".json"]),
-		script = "scripts/run_tximeta.R"
+		fastq1 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq_clip5.gz"])),
+		fastq2 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq_clip5.gz"]))
 	output:
-		os.path.join(outputdir, "outputR", "tximeta_se.rds")
-	log:
-		os.path.join(outputdir, "Rout", "tximeta_se.Rout")
-	benchmark:
-		os.path.join(outputdir, "benchmarks", "tximeta_se.txt")
+			fastq1 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq_clip5_sorted.gz"])),
+			fastq2 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq_clip5_sorted.gz"]))
 	params:
-		salmondir = lambda wildcards, input: os.path.dirname(os.path.dirname(input[1])),   ## dirname of second output
-		flag = config["annotation"],
-		organism = config["organism"],
-		Rbin = Rbin
-	conda:
-		Renv
+		FASTQtrimmeddir = lambda wildcards, output: os.path.dirname(output[0])   ## dirname of first output
+	benchmark:
+		os.path.join(outputdir, "benchmarks", "sort_clip5_{sample}.txt")
 	shell:
-		'''{params.Rbin} CMD BATCH --no-restore --no-save "--args salmondir='{params.salmondir}' json='{input.json}' metafile='{input.metatxt}' outrds='{output}' annotation='{params.flag}' organism='{params.organism}'" {input.script} {log}'''
+		"zcat {input.fastq1} | paste - - - - | sort -k1,1 -S 3G | tr '\t' '\n' | gzip > {output.fastq1}; "
+		"zcat {input.fastq2} | paste - - - - | sort -k1,1 -S 3G | tr '\t' '\n' | gzip > {output.fastq2}"
+
+## -S is buffer size for main memory: increase to -S 20G
+## --parallel=10
+
+
+# ## ------------------------------------------------------------------------------------ ##
+# ## Salmon abundance estimation
+# ## ------------------------------------------------------------------------------------ ##
+# # Estimate abundances with Salmon
+# rule salmonSE:
+# 	input:
+# 		index = os.path.join(config["salmonindex"], "versionInfo.json"),
+# 		fastq = os.path.join(outputdir, "FASTQtrimmed", "{sample}_trimmed.fq.gz") if config["run_trimming"] else os.path.join(FASTQdir, "".join(["{sample}.", str(config["fqsuffix"]), ".gz"]))
+# 	output:
+# 		os.path.join(outputdir, "salmon", "{sample}", "quant.sf")
+# 	log:
+# 		os.path.join(outputdir, "logs", "salmon_{sample}.log")
+# 	benchmark:
+# 		os.path.join(outputdir, "benchmarks", "salmon_{sample}.txt")
+# 	threads:
+# 		config["ncores"]
+# 	params:
+# 		salmonindex = lambda wildcards, input: os.path.dirname(input['index']),   ## dirname of index input
+# 		salmondir = lambda wildcards, output: os.path.dirname(os.path.dirname(output[0])),   ## dirname of first output
+# 		salmonextraparams = config["additional_salmon_quant"]
+# 	conda:
+# 		"envs/environment.yaml"
+# 	shell:
+# 		"echo 'Salmon version:\n' > {log}; salmon --version >> {log}; "
+# 		"salmon quant -i {params.salmonindex} -l A -r {input.fastq} "
+# 		"-o {params.salmondir}/{wildcards.sample} -p {threads} {params.salmonextraparams}"
+
+# rule salmonPE:
+# 	input:
+# 		index = os.path.join(config["salmonindex"], "versionInfo.json"),
+# 		fastq1 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq.gz"])) if config["run_trimming"] else os.path.join(FASTQdir, "".join(["{sample}_", str(config["fqext1"]), ".", str(config["fqsuffix"]), ".gz"])),
+# 		fastq2 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq.gz"])) if config["run_trimming"] else os.path.join(FASTQdir, "".join(["{sample}_", str(config["fqext2"]), ".", str(config["fqsuffix"]), ".gz"]))
+# 	output:
+# 		os.path.join(outputdir, "salmon", "{sample}", "quant.sf")
+# 	log:
+# 		os.path.join(outputdir, "logs", "salmon_{sample}.log")
+# 	benchmark:
+# 		os.path.join(outputdir, "benchmarks", "salmon_{sample}.txt")
+# 	threads:
+# 		config["ncores"]
+# 	params:
+# 		salmonindex = lambda wildcards, input: os.path.dirname(input['index']),   ## dirname of index input
+# 		salmondir = lambda wildcards, output: os.path.dirname(os.path.dirname(output[0])),   ## dirname of first output
+# 		salmonextraparams = config["additional_salmon_quant"]
+# 	conda:
+# 		"envs/environment.yaml"
+# 	shell:
+# 		"echo 'Salmon version:\n' > {log}; salmon --version >> {log}; "
+# 		"salmon quant -i {params.salmonindex} -l A -1 {input.fastq1} -2 {input.fastq2} "
+# 		"-o {params.salmondir}/{wildcards.sample} -p {threads} {params.salmonextraparams}"
+
+
+# ## ------------------------------------------------------------------------------------ ##
+# ## Transcript quantification
+# ## ------------------------------------------------------------------------------------ ##
+# ## tximeta
+# rule tximeta:
+# 	input:
+# 	    os.path.join(outputdir, "Rout", "pkginstall_state.txt"),
+# 		expand(os.path.join(outputdir, "salmon", "{sample}", "quant.sf"), sample = samples.names.values.tolist()),
+# 		metatxt = config["metatxt"],
+# 		salmonidx = os.path.join(config["salmonindex"], "versionInfo.json"),
+# 		json = "".join([config["salmonindex"], ".json"]),
+# 		script = "scripts/run_tximeta.R"
+# 	output:
+# 		os.path.join(outputdir, "outputR", "tximeta_se.rds")
+# 	log:
+# 		os.path.join(outputdir, "Rout", "tximeta_se.Rout")
+# 	benchmark:
+# 		os.path.join(outputdir, "benchmarks", "tximeta_se.txt")
+# 	params:
+# 		salmondir = lambda wildcards, input: os.path.dirname(os.path.dirname(input[1])),   ## dirname of second output
+# 		flag = config["annotation"],
+# 		organism = config["organism"],
+# 		Rbin = Rbin
+# 	conda:
+# 		Renv
+# 	shell:
+# 		'''{params.Rbin} CMD BATCH --no-restore --no-save "--args salmondir='{params.salmondir}' json='{input.json}' metafile='{input.metatxt}' outrds='{output}' annotation='{params.flag}' organism='{params.organism}'" {input.script} {log}'''
 
 
 ## ------------------------------------------------------------------------------------ ##
 ## STAR mapping
 ## ------------------------------------------------------------------------------------ ##
 ## Genome mapping with STAR
-rule starSE:
-	input:
-		index = os.path.join(config["STARindex"], "SA"),
-		fastq = os.path.join(outputdir, "FASTQtrimmed", "{sample}_trimmed.fq.gz") if config["run_trimming"] else os.path.join(FASTQdir, "".join(["{sample}.", str(config["fqsuffix"]), ".gz"]))
-	output:
-		os.path.join(outputdir, "STAR", "{sample}", "{sample}_Aligned.sortedByCoord.out.bam")
-	threads:
-		config["ncores"]
-	log:
-		os.path.join(outputdir, "logs", "STAR_{sample}.log")
-	benchmark:
-		os.path.join(outputdir, "benchmarks", "STAR_{sample}.txt")
-	params:
-		STARindex = lambda wildcards, input: os.path.dirname(input['index']),   ## dirname of index input
-		STARdir = lambda wildcards, output: os.path.dirname(os.path.dirname(output[0])),   ## dirname of first output
-		starextraparams = config["additional_star_align"]
-	conda:
-		"envs/environment.yaml"
-	shell:
-		"echo 'STAR version:\n' > {log}; STAR --version >> {log}; "
-		"STAR --genomeDir {params.STARindex} --readFilesIn {input.fastq} "
-		"--runThreadN {threads} --outFileNamePrefix {params.STARdir}/{wildcards.sample}/{wildcards.sample}_ "
-		"--outSAMtype BAM SortedByCoordinate --readFilesCommand gunzip -c "
-		"{params.starextraparams}"
-
 rule starPE:
 	input:
 		index = os.path.join(config["STARindex"], "SA"),
 		fastq1 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq.gz"])) if config["run_trimming"] else os.path.join(FASTQdir, "".join(["{sample}_", str(config["fqext1"]), ".", str(config["fqsuffix"]), ".gz"])),
 		fastq2 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq.gz"])) if config["run_trimming"] else os.path.join(FASTQdir, "".join(["{sample}_", str(config["fqext2"]), ".", str(config["fqsuffix"]), ".gz"]))
 	output:
-		os.path.join(outputdir, "STAR", "{sample}", "{sample}_Aligned.sortedByCoord.out.bam")
+		os.path.join(outputdir, config["star_output"], "{sample}", "{sample}_Aligned.sortedByCoord.out.bam")
 	threads:
 		config["ncores"]
 	log:
@@ -549,6 +605,11 @@ rule starPE:
 		"--runThreadN {threads} --outFileNamePrefix {params.STARdir}/{wildcards.sample}/{wildcards.sample}_ "
 		"--outSAMtype BAM SortedByCoordinate --readFilesCommand gunzip -c "
 		"{params.starextraparams}"
+
+
+
+
+
 
 rule starPE_2nd_round:
 	input:
@@ -577,16 +638,109 @@ rule starPE_2nd_round:
 		"{params.starextraparams}"
 
 
+
+rule starPE_clip5:
+	input:
+		index = os.path.join(config["STARindex"], "SA"),
+		fastq1 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq_clip5.gz"])),
+		fastq2 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq_clip5.gz"]))
+	output:
+		os.path.join(outputdir, "STAR_clip5", "{sample}", "{sample}_Aligned.sortedByCoord.out.bam")
+	threads:
+		config["ncores"]
+	log:
+		os.path.join(outputdir, "logs", "STAR_clip5_{sample}.log")
+	benchmark:
+		os.path.join(outputdir, "benchmarks", "STAR_clip5_{sample}.txt")
+	params:
+		STARindex = lambda wildcards, input: os.path.dirname(input['index']),   ## dirname of index input
+		STARdir = lambda wildcards, output: os.path.dirname(os.path.dirname(output[0])),   ## dirname of first output
+		starextraparams = config["additional_star_align"]
+	conda:
+		"envs/environment.yaml"
+	shell:
+		"echo 'STAR version:\n' > {log}; STAR --version >> {log}; "
+		"STAR --genomeDir {params.STARindex} --readFilesIn {input.fastq1} {input.fastq2} "
+		"--runThreadN {threads} --outFileNamePrefix {params.STARdir}/{wildcards.sample}/{wildcards.sample}_ "
+		"--outSAMtype BAM SortedByCoordinate --readFilesCommand gunzip -c "
+		"{params.starextraparams}"
+
+
+rule star_clip5_separate:
+	input:
+		index = os.path.join(config["STARindex"], "SA"),
+		# fastq1 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext1"]), "_val_1.fq_clip5.gz"])) ,
+		fastq2 = os.path.join(outputdir, "FASTQtrimmed", "".join(["{sample}_", str(config["fqext2"]), "_val_2.fq_clip5.gz"]))
+	output:
+		# out1 = os.path.join(outputdir, "STAR_clip5", "{sample}", "{sample}_R1_Aligned.sortedByCoord.out.bam"),
+		out2 = os.path.join(outputdir, config["star_output"], "{sample}", "{sample}_R2_Aligned.sortedByCoord.out.bam")
+	threads:
+		config["ncores"]
+	log:
+		os.path.join(outputdir, "logs", "STAR_clip5_{sample}.log")
+	benchmark:
+		os.path.join(outputdir, "benchmarks", "STAR_clip5_{sample}.txt")
+	params:
+		STARindex = lambda wildcards, input: os.path.dirname(input['index']),   ## dirname of index input
+		STARdir = lambda wildcards, output: os.path.dirname(os.path.dirname(output[0])),   ## dirname of first output
+		starextraparams = config["additional_star_align"]
+	conda:
+		"envs/environment.yaml"
+	shell:
+		"echo 'STAR version:\n' > {log}; STAR --version >> {log}; "
+		# "STAR --genomeDir {params.STARindex} --readFilesIn {input.fastq1} "
+		# "--runThreadN {threads} --outFileNamePrefix {params.STARdir}/{wildcards.sample}/{wildcards.sample}_R1_ "
+		# "--outSAMtype BAM SortedByCoordinate --readFilesCommand gunzip -c "
+		# "{params.starextraparams}; "
+		"STAR --genomeDir {params.STARindex} --readFilesIn {input.fastq2} "
+		"--runThreadN {threads} --outFileNamePrefix {params.STARdir}/{wildcards.sample}/{wildcards.sample}_R2_ "
+		"--outSAMtype BAM SortedByCoordinate --readFilesCommand gunzip -c "
+		"{params.starextraparams}"
+
+
+
+
 ## Index bam files
 rule bamindex:
 	input:
-		bam = os.path.join(outputdir, "STAR", "{sample}", "{sample}_Aligned.sortedByCoord.out.bam")
+		bam = os.path.join(outputdir, config["star_output"], "{sample}", "{sample}_Aligned.sortedByCoord.out.bam")
 	output:
-		os.path.join(outputdir, "STAR", "{sample}", "{sample}_Aligned.sortedByCoord.out.bam.bai")
+		os.path.join(outputdir, config["star_output"], "{sample}", "{sample}_Aligned.sortedByCoord.out.bam.bai")
 	log:
 		os.path.join(outputdir, "logs", "samtools_index_{sample}.log")
 	benchmark:
 		os.path.join(outputdir, "benchmarks", "samtools_index_{sample}.txt")
+	conda:
+		"envs/environment.yaml"
+	shell:
+		"echo 'samtools version:\n' > {log}; samtools --version >> {log}; "
+		"samtools index {input.bam}"
+
+## Index bam files
+rule bamindex_clip5:
+	input:
+		bam = os.path.join(outputdir, "STAR_clip5", "{sample}", "{sample}_Aligned.sortedByCoord.out.bam")
+	output:
+		os.path.join(outputdir, "STAR_clip5", "{sample}", "{sample}_Aligned.sortedByCoord.out.bam.bai")
+	log:
+		os.path.join(outputdir, "logs", "samtools_index_clip5_{sample}.log")
+	benchmark:
+		os.path.join(outputdir, "benchmarks", "samtools_index_clip5_{sample}.txt")
+	conda:
+		"envs/environment.yaml"
+	shell:
+		"echo 'samtools version:\n' > {log}; samtools --version >> {log}; "
+		"samtools index {input.bam}"
+
+rule bamindex_clip5_R2:
+	input:
+		bam = os.path.join(outputdir, config["star_output"], "{sample}", "{sample}_R2_Aligned.sortedByCoord.out.bam")
+	output:
+		os.path.join(outputdir, config["star_output"], "{sample}", "{sample}_R2_Aligned.sortedByCoord.out.bam.bai")
+	log:
+		os.path.join(outputdir, "logs", "samtools_index_clip5_R2_{sample}.log")
+	benchmark:
+		os.path.join(outputdir, "benchmarks", "samtools_index_clip5_R2_{sample}.txt")
 	conda:
 		"envs/environment.yaml"
 	shell:
@@ -652,11 +806,11 @@ rule normalize_replicates_bigwig:
 
 rule remove_PCR_duplicates:
 	input:
-		os.path.join(outputdir, "STAR/{sample}/{sample}_Aligned.sortedByCoord.out.bam")
+		os.path.join(outputdir, config["star_output"], "{sample}/{sample}_Aligned.sortedByCoord.out.bam")
 	output:
-		os.path.join(outputdir, "BAM_deduplicated/{sample}_deduplicated.bam")
+		os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.bam")
 	params:
-		metrics_file = os.path.join(outputdir, "BAM_deduplicated/{sample}_marked_dup_metrics.txt")
+		metrics_file = os.path.join(outputdir, config["dedup_output"], "{sample}_marked_dup_metrics.txt")
 	shell:
 		"picard MarkDuplicates "
 		"I={input} "
@@ -664,13 +818,26 @@ rule remove_PCR_duplicates:
 		"M={params.metrics_file} "
 		"REMOVE_DUPLICATES=true "
 
+rule remove_PCR_duplicates_R2:
+	input:
+		os.path.join(outputdir, config["star_output"], "{sample}", "{sample}_R2_Aligned.sortedByCoord.out.bam")
+	output:
+		os.path.join(outputdir, config["dedup_output"], "{sample}_R2_deduplicated.bam")
+	params:
+		metrics_file = os.path.join(outputdir, config["dedup_output"], "{sample}_R2_marked_dup_metrics.txt")
+	shell:
+		"picard MarkDuplicates "
+		"I={input} "
+		"O={output} "
+		"M={params.metrics_file} "
+		"REMOVE_DUPLICATES=true "
 
 ## Index bam files
 rule dedupidx:
 	input:
-		bam = os.path.join(outputdir, "BAM_deduplicated/{sample}.bam")
+		bam = os.path.join(outputdir, config["dedup_output"], "{sample}.bam")
 	output:
-		os.path.join(outputdir, "BAM_deduplicated/{sample}.bam.bai")
+		os.path.join(outputdir, config["dedup_output"], "{sample}.bam.bai")
 	shell:
 		"samtools index {input.bam}"
 
@@ -691,7 +858,7 @@ rule filter_second_read:
 ## Convert BAM files to bigWig
 rule bigwig_second_read:
 	input:
-		bam = os.path.join(outputdir, "BAM_deduplicated", "{sample}_deduplicated.r2.bam"),
+		bam = os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.r2.bam"),
 		chrl = os.path.join(config["STARindex"], "chrNameLength.txt")
 	output:
 		os.path.join(outputdir, "bigwig", "{sample}_deduplicated.r2.bw")
@@ -720,9 +887,9 @@ rule bigwig_second_read:
 ## convert the Ensembl BAM file to UCSC
 rule convert_BAM_UCSC:
 	input:
-		bam = os.path.join(outputdir, "BAM_deduplicated/{sample}_deduplicated.r2.bam")
+		bam = os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.r2.bam")
 	output: 
-		os.path.join(outputdir, "BAM_deduplicated/{sample}_deduplicated.r2.ucsc.bam")
+		os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.r2.ucsc.bam")
 	shell:
 		"samtools view -H {input.bam} | perl -lpe 's/SN:([0-9]+|[XY]|MT)\\b/SN:chr$1/' > {input.bam}_header.ucsc.sam; "
 		"sed -i 's/SN:chrMT/SN:chrM/g' {input.bam}_header.ucsc.sam; "
@@ -731,7 +898,7 @@ rule convert_BAM_UCSC:
 ## We use GRCh38_fixed which is the internal CLIPper annotation from which we had removed genome patches that were not present in our samples
 rule clipper:
 	input:
-		bam = os.path.join(outputdir, "BAM_deduplicated/{sample}_deduplicated.r2.ucsc.bam")
+		bam = os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.r2.ucsc.bam")
 	output:
 		peaks = os.path.join(outputdir, config["clipper"], "{sample}_deduplicated.r2.ucsc.clipper_peaks.bed")
 	threads:
@@ -744,6 +911,33 @@ rule clipper:
 		"set -eu"
 
 ## We are using `set +eu` to fix a conda error as suggested here: https://github.com/conda/conda/issues/8186 
+
+## For the clipped R2
+## convert the Ensembl BAM file to UCSC
+rule convert_BAM_UCSC_clip5_R2:
+	input:
+		bam = os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.bam")
+	output: 
+		os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.ucsc.bam")
+	shell:
+		"samtools view -H {input.bam} | perl -lpe 's/SN:([0-9]+|[XY]|MT)\\b/SN:chr$1/' > {input.bam}_header.ucsc.sam; "
+		"sed -i 's/SN:chrMT/SN:chrM/g' {input.bam}_header.ucsc.sam; "
+		"samtools reheader {input.bam}_header.ucsc.sam {input.bam} > {output}"
+
+rule clipper_clip5_R2:
+	input:
+		bam = os.path.join(outputdir, config["dedup_output"], "{sample}_deduplicated.ucsc.bam")
+	output:
+		peaks = os.path.join(outputdir, config["clipper"], "{sample}_deduplicated.ucsc.clipper_peaks.bed")
+	threads:
+		config["ncores"]
+	shell:
+		"set +eu;"
+		"source activate clipper3; "
+		"clipper -b {input.bam} -s GRCh38_fixed --processors={threads} -o {output.peaks};"
+		"source deactivate;"
+		"set -eu"
+
 
 
 
