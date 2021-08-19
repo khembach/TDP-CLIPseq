@@ -1,0 +1,686 @@
+---
+title: "merge_peaks results analysis"
+author: "Katharina Hembach"
+date: "2/26/2021"
+output: 
+  html_document:
+  toc: true
+toc_float: true
+---
+  
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")))
+```
+
+### Load packages
+```{r, message = FALSE}
+library(here)
+library(stringr)
+library(rtracklayer)
+library(data.table)
+library(ggplot2)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(dplyr)
+library(GenomicAlignments)
+library(eulerr)
+library(ComplexHeatmap)
+library(VennDiagram)
+library(ggpubr)
+library(Biostrings)
+library(ggrepel)
+library(tidyr)
+```
+
+# Data import
+
+We import the merge_peaks results.
+```{r import-mp}
+gtf_file <- here("reference", "Homo_sapiens.GRCh38.98_snoDB.sorted.gtf")
+gtf <- import(gtf_file)
+genes <- gtf[gtf$type =="gene"]
+
+mp <- list("WT" = import(here("IDR_merge_peaks", "clip5", "merge_peaks_2inputs_WT", "results", "WT.vs.WT2.bed")), 
+           "6M" = import(here("IDR_merge_peaks", "clip5", "merge_peaks_2inputs_6M", "results", "6M.vs.6M2.bed")), 
+           "RBDm" = import(here("IDR_merge_peaks", "clip5", "merge_peaks_2inputs_RBDm", "results", "RBDm.vs.RBDm2.bed")))
+lengths(mp)
+## Distribution of the peak length
+lapply(mp, function(x) summary(width(x)))
+mp[[1]]
+```
+According to the merge_peaks github page, the name columnn is the minimum of the -log10 p-value between two replicates (column 4) and the score column is the geomean of the log2 fold changes (column 5). I assume the logFC is computed but CLIP-seq reads over RNA-seq reads (we use them instead of input files).
+
+What is the distribution of these two values?
+
+```{r}
+lapply(mp, function(x) summary(as.numeric(x$name)))
+lapply(mp, function(x) summary(x$score))
+
+lapply(mp, function(x) hist(as.numeric(x$name), breaks = 30))
+lapply(mp, function(x) hist(x$score, breaks = 30))
+
+## are the two values correlated?
+lapply(mp, function(x) plot(as.numeric(x$name), x$score))
+```
+
+
+# Annotate peaks
+
+We annotate the peaks based on the genes with which they are overlapping. The annotation table will contain a peak ID and a vector with the names of all target genes. 
+
+```{r annotate-peaks}
+## convert peaks to Ensembl
+mp <- lapply(mp, function(x) {seqlevelsStyle(x) <- "Ensembl"; x})
+
+## each peak get's a number as ID
+mp <- lapply(mp, function(x){
+  x$ID <- 1:length(x)
+  x
+})
+
+mp_an <- lapply(names(mp), function(x) {
+  olap <- findOverlaps(mp[[x]], genes, ignore.strand = FALSE)  
+  data.frame(peak_id = mp[[x]][queryHits(olap)]$ID, 
+             gene_id = genes[subjectHits(olap)]$gene_id)
+})
+names(mp_an) <- names(mp)
+lapply(mp_an, nrow)
+## number of target genes
+lapply(mp_an, function(x) x$gene_id %>% unique %>% length)
+```
+
+## Filter target genes based on peak location
+
+We filter out protein coding genes and spliced lncRNAs where all peaks overlaps with small RNAs, because we saw in IGV that all these examples show now evidence of actual binding to the long genes.
+
+For all protein coding genes, if RBDm peaks are exclusively present in regions overlapping to small RNA gene, it gets reassigned to that gene and the annotation to the protein-coding gene is removed.
+```{r filter-target-genes}
+## we tested different overlap values and decided to use 70%
+to_filter <- lapply(names(mp_an), function(s) {
+  x <- mp_an[[s]]
+  g <- genes[genes$gene_id %in% x$gene_id]
+  ##seperate protein coding and long lncRNAs from short genes
+  pc <- g[g$gene_biotype == "protein_coding"]$gene_id
+  ## separate spliced from unspliced lncRNAs
+  lnc <- g[g$gene_biotype == "lncRNA"]$gene_id
+  g1 <- gtf[gtf$gene_id %in% lnc]
+  e <- g1[g1$type == "exon"]
+  sp <- split(e$exon_number, e$gene_id)
+  ## all lncRNAs with more than 1 exon
+  lnc_spl <- names(sp)[lengths(lapply(sp, unique)) > 1]
+  ## all spliced genes, that need to be checked for potential false positives
+  pc <- c(pc, g[g$gene_id %in% lnc_spl]$gene_id)
+  ## list of small RNAs that might cause the peaks in the long genes
+  ## ## except TEC, MT_rRNA, 
+  # short <- g[g$gene_biotype %in% c("lncRNA", "miRNA", "misc_RNA", "rRNA", 
+  #                                  "ribozyme", "scaRNA", "snRNA",  "snoRNA")]
+  ## everything except the protein coding genes
+  short <- g[!g$gene_biotype %in% c("protein_coding", "Mt_rRNA", "ribozyme",
+                                    "processed_pseudogene", "rRNA", 
+                                    "rRNA_pseudogene", "unprocessed_pseudogene",
+                                    "transcribed_processed_pseudogene", 
+                                    "transcribed_unitary_pseudogene", 
+                                    "transcribed_unprocessed_pseudogene", 
+                                    "unitary_pseudogene", "TEC")]
+  ## remove the long lncRNAs
+  short <- short[!short$gene_id %in% pc]
+  ## go through  the list of genes and determine if all peaks overlap small RNAs
+  res <- lapply(pc, function(i) {
+    peaks <- x[x$gene_id ==i, "peak_id"]
+    # nr_olap <- countOverlaps(mp[[s]][mp[[s]]$ID %in% peaks], short, 
+    #                          ignore.strand = FALSE)
+  
+
+    ## determine how much of the peak is overlapping the short RNAs
+    p <- mp[[s]][mp[[s]]$ID %in% peaks]
+    cov <- coverage(c(p, short))
+    ## determine percentage of peak that is overlapping the small RNA
+    ## coverage = 1 is only peak
+    ## coverage >1 is overlapping small RNA
+    if (all(sum(cov[p] > 1)/lengths(p) > 0.7)) {
+    ## at least 70% of the peak has to overlap a small RNA
+    # if(all(nr_olap > 0)){ ## all peaks overlap at least one short RNA
+      return(i)
+    } 
+    return(NULL)
+  })
+  unique(unlist(res)) ## all genes that are no true targets
+})
+names(to_filter) <- names(mp_an)
+lengths(to_filter)
+```
+
+```{r remove-filter-genes}
+# what are the filtered genes?
+lapply(to_filter, function(x){
+  g <- genes[genes$gene_id %in% x]
+  m <- match(x, g$gene_id)
+  data.frame(gene_id = x, gene_name = g[m]$gene_name, 
+             gene_biotype = g[m]$gene_biotype )
+  })
+lapply(to_filter, function(x) genes[genes$gene_id %in% x]$gene_name)
+
+## remove the wrong targets from the list
+nam <- names(mp_an)
+mp_an <- lapply(names(mp_an), function(x) {
+  mp_an[[x]] %>% dplyr::filter(!gene_id %in% to_filter[[x]])
+})
+names(mp_an) <- nam
+
+## number of target genes after filtering
+lapply(mp_an, function(x) {
+  length(unique(x$gene_id))})
+
+saveRDS(mp_an, here("Rmd", "rds", "clip5_mp_an.rds"))
+```
+
+
+# Construct gene table
+
+We need a table with all target genes and the number of peaks per gene.
+
+```{r gdf}
+## data.frame with all target genes
+gdf <- as.data.frame(genes[genes$gene_id %in% 
+    (lapply(mp_an, function(x) x$gene_id %>% unique) %>% unlist %>% unique)]) %>% 
+  dplyr::select(seqnames, start, end, strand, gene_id, gene_name, gene_biotype)
+  
+## add the number of peaks per sample
+for(i in c("WT", "6M", "RBDm")){
+  pcount <- mp_an[[i]] %>% dplyr::group_by(gene_id) %>% dplyr::summarise(n = n())
+  m <- match(gdf$gene_id, pcount$gene_id)
+  cname <- paste0("npeaks_", i)
+  gdf[,cname] <- pcount$n[m]
+  gdf[is.na(gdf[,cname]) ,cname] <- 0
+  # ## mean max coverage of sum of norm. cov of both replicates
+  # cname <- paste0("mean_max_cov_sum_", i)
+  # sp <- split(mp_an[[i]]$peak_id, mp_an[[i]]$gene_id)
+  # p <- lapply(sp, function(x) {
+  #   mean(mp[[i]][mp[[i]]$ID %in% x]$merged_max_cov)})
+  # m <- match(names(p), gdf$gene_id)
+  # gdf[,cname] <- 0
+  # gdf[,cname][m] <- unlist(p)
+}
+
+gdf$npeaks_max <- pmax(gdf$npeaks_6M, gdf$npeaks_RBDm, gdf$npeaks_WT)
+## sort according to number of peaks
+gdf <- gdf %>% dplyr::arrange(desc(npeaks_max))
+gdf %>% dplyr::arrange(desc(npeaks_WT)) %>% head
+gdf %>% dplyr::arrange(desc(npeaks_6M)) %>% head
+gdf %>% dplyr::arrange(desc(npeaks_RBDm)) %>% head
+
+## distribution of gene types
+gdf$gene_biotype %>% table
+## we remove pseudogenes
+gdf <- gdf %>% dplyr::filter(!gene_biotype %in% 
+    c("processed_pseudogene", "rRNA_pseudogene", "unprocessed_pseudogene",
+      "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene", 
+      "transcribed_unprocessed_pseudogene", "unitary_pseudogene", "TEC"))
+
+gdf$gene_biotype %>% table
+nrow(gdf)
+
+## genes with 6M peaks but 0 WT peak
+gdf %>% dplyr::arrange(desc(npeaks_6M)) %>% 
+  dplyr::filter(npeaks_WT == 0) %>% 
+  head
+
+## bound in WT and RBDm, but not 6M
+gdf %>% dplyr::filter(npeaks_6M == 0 & npeaks_WT > 0 & npeaks_RBDm > 0) %>% 
+  head
+
+write.table(gdf, here("analysis", "clip5", "mp_analysis", "gene_peak_count_merge_peaks_filtered.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+
+# Venn diagram
+
+Venn and euler diagram of the genes with at least one peak
+
+```{r venn-diagram}
+gene_list <- list("WT" = gdf$gene_id[gdf$npeaks_WT>0], 
+                  "6M" = gdf$gene_id[gdf$npeaks_6M>0], 
+                  "RBDm" = gdf$gene_id[gdf$npeaks_RBDm>0])
+euler_diag <- euler(gene_list, shape = "circle")
+venn_diag <- venn(gene_list)
+
+eulerr_options(labels = list(fontsize = 20), 
+               quantities = list(fontsize = 20, font = 2), 
+               fills = list(alpha = 0.5),
+               padding = unit(0.6, "lines"))
+p <- plot(euler_diag, font=1, 
+     fills=c("#117733", "#882255", "steelblue3"),
+     edges=c("#117733", "#882255", "steelblue3"),
+     labels = list(col = c("#117733", "#882255", "steelblue4")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+svg(here("analysis", "clip5", "figures", "mp_euler.svg")); p; dev.off()
+
+p <- plot(venn_diag,font=1, 
+     fills=c("#117733", "#882255", "steelblue3"),
+     edges=c("#117733", "#882255", "steelblue3"),
+     labels = list(col = c("#117733", "#882255", "steelblue4")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+svg(here("analysis", "clip5", "figures", "mp_venn.svg")); p; dev.off()
+```
+
+What are the genes with peaks in only the 6M or RBDm samples?
+
+```{r unique_peaks}
+## 6M specific
+gdf %>% dplyr::filter(npeaks_WT == 0 & npeaks_RBDm == 0) %>% dplyr::pull(gene_name)
+
+## RBDm specific
+gdf %>% dplyr::filter(npeaks_WT == 0 & npeaks_6M == 0) %>% dplyr::pull(gene_name)
+```
+
+
+# Classification of genes
+
+We classify the genes with at least one peak into unique and shared genes per group.
+There are three unique sets: genes with peaks from only one group: WT, 6M and RBDm specific.
+There are three sets that are shared between two groups: WT-6M, WT-RBDm, 6M-RBDm
+There is one set that is shared between all three groups: WT-6M-RBDm.
+```{r gene-sets}
+## all target genes of WT, 6M and RBDm
+gene_sets <- list(WT = gdf %>% dplyr::filter(npeaks_WT > 0), 
+                  "6M" = gdf %>% dplyr::filter(npeaks_6M > 0),
+                  RBDm = gdf %>% dplyr::filter(npeaks_RBDm > 0))
+lapply(gene_sets, nrow)
+
+## all target genes unique to WT, shared between WT and 6M 
+## or shared between WT, 6M and RBDm
+gene_sets_wt <- list(WT = gdf %>% 
+                dplyr::filter(npeaks_WT > 0 & npeaks_6M == 0 & npeaks_RBDm == 0), 
+                  "6M" = gdf %>% 
+                dplyr::filter(npeaks_WT > 0 & npeaks_6M > 0 & npeaks_RBDm == 0),
+                RBDm6M = gdf %>% 
+                dplyr::filter(npeaks_WT > 0 & npeaks_6M > 0 & npeaks_RBDm > 0))
+lapply(gene_sets_wt, nrow)
+```
+
+
+## Distribution of gene biotype
+
+```{r gene-biotype-distr}
+# number of genes
+lapply(gene_sets, function(x) x$gene_biotype %>% table)
+
+## We summarize the small biotype categories because we need equal categories for the Chi-squared test and because the frequencies have should be >5.%
+## we keep lncRNA, protein_coding,  snoRNA, 
+## and merge scaRNA, snRNA,  misc_RNA, miRNA, Mt_rRNA, ribozyme, rRNA into the category "other"
+gene_sets<- lapply(gene_sets, function(x) {
+   x$gene_biotype_category <- ifelse(x$gene_biotype %in% 
+                                      c("scaRNA", "snRNA", "misc_RNA", "miRNA",
+                                        "Mt_rRNA", "ribozyme", "rRNA", "Mt_tRNA"), 
+                                     "other", x$gene_biotype)
+   x})
+lapply(gene_sets, function(x) x$gene_biotype_category %>% table)
+# percentage
+lapply(gene_sets, function(x){
+  a <- x$gene_biotype_category
+  n <- length(a)
+  round(table(a)/n*100, digits = 2)}
+  )
+
+df <- data.frame(sample = c(rep("WT", nrow(gene_sets[["WT"]])),
+                            rep("6M", nrow(gene_sets[["6M"]])),
+                            rep("RBDm", nrow(gene_sets[["RBDm"]]))),
+                 biotype = c(gene_sets[["WT"]]$gene_biotype,
+                             gene_sets[["6M"]]$gene_biotype, 
+                             gene_sets[["RBDm"]]$gene_biotype)) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("WT", "6M", "RBDm"))) %>%
+  dplyr::group_by(sample, biotype) %>% dplyr::summarize(nr_genes = n())
+cols <- c("#DB7093","#E8601C","#7BAFDE","#1965B0", "#B17BA6", "#882E72",
+          "#F1932D","#F6C141","#F7EE55","#4EB265", "#90C987","#CAEDAB",
+          "#777777", "black")
+cols <- cols[c(1, 3, 6, 7, 14, 10, 9, 2, 5, 4, 13)]
+p <- ggplot(df, aes(x = sample, y = nr_genes, fill = biotype)) + 
+    geom_bar(position = "fill", stat = "identity") + 
+    theme_bw() +
+    facet_wrap(~sample, nrow = 1, scales = "free_x") +
+    theme(text = element_text(size = 14), legend.position = "right", 
+          # legend.direction="horizontal", legend.box = "horizontal", 
+          plot.title = element_text(hjust = 0.5)) +
+    ylab("fraction of genes") +
+    scale_fill_manual(values = cols)
+p
+svg(here("analysis", "clip5", "figures", 
+         "gene_biotype_all_genes.svg")); p; dev.off()
+
+df <- data.frame(sample = c(rep("WT", nrow(gene_sets[["WT"]])),
+                            rep("6M", nrow(gene_sets[["6M"]])),
+                            rep("RBDm", nrow(gene_sets[["RBDm"]]))),
+                 biotype = c(gene_sets[["WT"]]$gene_biotype_category,
+                             gene_sets[["6M"]]$gene_biotype_category, 
+                             gene_sets[["RBDm"]]$gene_biotype_category)) %>%
+   dplyr::mutate(biotype = factor(biotype, 
+                                  levels = c("lncRNA", "protein_coding", 
+                                             "snoRNA",  "other"))) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("WT", "6M", "RBDm"))) %>%
+  dplyr::group_by(sample, biotype) %>% dplyr::summarize(nr_genes = n())
+cols <- c(brewer.pal(n = 8, name = "Set2")[1:3],  "darkgrey")
+p <- ggplot(df, aes(x = sample, y = nr_genes, fill = biotype)) + 
+    geom_bar(position = "fill", stat = "identity") + 
+    theme_bw() +
+    facet_wrap(~sample, nrow = 1, scales = "free_x") +
+    theme(text = element_text(size = 14), legend.position = "right", 
+          # legend.direction="horizontal", legend.box = "horizontal", 
+          plot.title = element_text(hjust = 0.5)) +
+    ylab("fraction of genes") +
+    scale_fill_manual(values = cols)
+p
+svg(here("analysis", "clip5", "figures", "gene_biotype.svg")); p; dev.off()
+```
+
+Chi-square goodness of fit test to compare observed to expected (WT) distribution. 
+```{r biotype-chi-square-test}
+## 6M vs. WT prop
+(counts <- table(gene_sets[["6M"]]$gene_biotype_category))
+(exp_prop <- table(gene_sets[["WT"]]$gene_biotype_category)/nrow(gene_sets[["WT"]]))
+chisq.test(x = counts, p = exp_prop)
+## RBDm vs. WT prop
+(counts <- table(gene_sets[["RBDm"]]$gene_biotype_category))
+(exp_prop <- table(gene_sets[["WT"]]$gene_biotype_category)/nrow(gene_sets[["WT"]]))
+chisq.test(x = counts, p = exp_prop)
+## RBDm vs. 6M prop
+(counts <- table(gene_sets[["RBDm"]]$gene_biotype_category))
+(exp_prop <- table(gene_sets[["6M"]]$gene_biotype_category)/nrow(gene_sets[["6M"]]))
+chisq.test(x = counts, p = exp_prop)
+## WT vsl WT prop --> should not be significant
+(counts <- table(gene_sets[["WT"]]$gene_biotype_category))
+(exp_prop <- table(gene_sets[["WT"]]$gene_biotype_category)/nrow(gene_sets[["WT"]]))
+chisq.test(x = counts, p = exp_prop)
+```
+
+The observed proportions are significantly different from the expected proportions in all three comparisons.
+
+### Distribution of gene biotype in genes shared with WT and 6M/RBDm
+
+```{r}
+lapply(gene_sets_wt, function(x) x$gene_biotype %>% table)
+
+df <- data.frame(sample = c(rep("WT", nrow(gene_sets_wt[["WT"]])),
+                      rep("6M", nrow(gene_sets_wt[["6M"]])),
+                      rep("RBDm6M", nrow(gene_sets_wt[["RBDm6M"]]))),
+           biotype = c(gene_sets_wt[["WT"]]$gene_biotype,
+                       gene_sets_wt[["6M"]]$gene_biotype, 
+                       gene_sets_wt[["RBDm6M"]]$gene_biotype)) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("WT", "6M", "RBDm6M"))) %>%
+  dplyr::group_by(sample, biotype) %>% dplyr::summarize(nr_genes = n())
+cols <- c("#DB7093","#E8601C","#7BAFDE","#1965B0", "#B17BA6", "#882E72",
+          "#F1932D","#F6C141","#F7EE55","#4EB265", "#90C987","#CAEDAB",
+          "#777777", "black")
+cols <- cols[c(1, 3, 6, 7, 10, 9, 2, 5, 4, 13)]
+p <- ggplot(df, aes(x = sample, y = nr_genes, fill = biotype)) + 
+    geom_bar(position = "fill", stat = "identity") + 
+    theme_bw() +
+    facet_wrap(~sample, nrow = 1, scales = "free_x") +
+    theme(text = element_text(size = 14), legend.position = "right", 
+          # legend.direction="horizontal", legend.box = "horizontal", 
+          plot.title = element_text(hjust = 0.5)) +
+    ylab("fraction of genes") +
+    scale_fill_manual(values = cols)
+p
+svg(here("analysis", "clip5", "figures", 
+         "gene_biotype_WT_shared_genes.svg")); p; dev.off()
+```
+
+
+## Distribution of gene length
+```{r gene-length-distribution}
+lapply(gene_sets, function(x) summary(x$end - x$start+1))
+df <- data.frame(gene_set = c(rep("WT", nrow(gene_sets[["WT"]])),
+                        rep("6M", nrow(gene_sets[["6M"]])), 
+                        rep("RBDm", nrow(gene_sets[["RBDm"]]))),
+           gene_length = c(gene_sets[["WT"]]$end - gene_sets[["WT"]]$start +1,
+                           gene_sets[["6M"]]$end - gene_sets[["6M"]]$start +1,
+                           gene_sets[["RBDm"]]$end - 
+                             gene_sets[["RBDm"]]$start +1))
+write.table(df, here("analysis", "clip5", "df_gene_lengths_per_sample.txt"), 
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+ggplot(df, aes(x = gene_set, y = gene_length)) +
+    geom_violin() + 
+    geom_boxplot(width=0.1) + theme_bw() + scale_y_log10()
+```
+
+We test for significant differences between the distributiosn with pairwise Mann–Whitney U tests and correct for multiple testing.
+```{r test-sign-gene-length}
+pairwise.wilcox.test(df$gene_length, df$gene_set, p.adjust.method = "BH")
+```
+
+# Annotation of peak location
+
+We annotated the exact peak location in protein coding genes, because we want to differentiate between exonic, intronic and UTR peaks.
+For this, we only consider the gene annotations of the corresponding gene. For example, a peak in an intron of a protein coding gene that also overlaps with a snoRNA will be annotated as intronic, because the snoRNA annotations are ignored.
+
+```{r prepare-anno-peak-location}
+## filter protein coding genes
+pc_id <- gdf[gdf$gene_biotype == "protein_coding","gene_id"]
+length(pc_id)
+## per gene, get corresponding peaks and gene annotations
+ann <- list()
+ann1 <- gtf[gtf$gene_id %in% pc_id]
+# seqlevelsStyle(ann1) <- "UCSC"
+ann[["e"]] <- ann1[ann1$type == "exon"]
+ann[["5UTR"]] <-  ann1[ann1$type == "five_prime_utr"]
+ann[["3UTR"]] <-  ann1[ann1$type == "three_prime_utr"]
+
+## we reduce the UTR annotations to unique ranges and remove exonic regions that overlap any UTR
+ann_pc <- lapply(pc_id, function(i) {
+  utr5 <- reduce(ann[["5UTR"]][ann[["5UTR"]]$gene_id == i])
+  if(length(utr5) > 0) utr5$type <- "five_prime_utr"
+  utr3 <- reduce(ann[["3UTR"]][ann[["3UTR"]]$gene_id == i])
+  if(length(utr3) > 0) utr3$type <- "three_prime_utr"
+  e <- GenomicRanges::setdiff(reduce(ann[["e"]][ann[["e"]]$gene_id == i]), 
+                              c(utr5, utr3))
+  e$type <- "exon"
+  c(utr5, utr3,e)
+})
+names(ann_pc) <- pc_id
+saveRDS(ann_pc, here("Rmd", "rds", "clip5_mp_ann_pc.rds"))
+```
+
+
+```{r peak-location-pc-genes}
+## table with peak ID, gene ID and peak location within pc gene
+mp_pc <- lapply(mp_an, function(x) {
+  z <- x[x$gene_id %in% pc_id,] 
+  z$peak_location <- NA
+  z})
+
+## if peak overlaps with 5UTR, 3UTR or exon, it gets the corresponding 
+## annotation with 5UTR > 3UTR > exon, else the peak is in an intron
+for(i in pc_id){
+  a <- ann_pc[[i]]
+  for(s in names(mp_pc)) {
+    ind <- which(mp_pc[[s]]$gene_id == i)
+    if(length(ind > 0)) {
+      p <- mp[[s]][mp[[s]]$ID %in% mp_pc[[s]]$peak_id[ind]] ## all peaks
+      olap <- findOverlaps(p, a, select = "first")
+      ## olap: vector of length p; NA if p does not overlap with any range in a, 
+      ## index of range in a that overlaps with p
+      mp_pc[[s]]$peak_location[ind[which(!is.na(olap))]] <- a[olap[!is.na(olap)]]$type
+    }
+  }
+}
+
+## whenever the peak does not overlap an exon or UTR, it's intronic
+mp_pc <- lapply(mp_pc, function(x) {
+  x$peak_location[is.na(x$peak_location)] <- "intron"
+  x
+})
+
+## save location annotation per peak
+saveRDS(mp_pc, here("Rmd", "rds", "clip5_mp_pc.rds"))
+```
+
+## Distribution of peak annotions
+
+How are the peak locations distributed among the three samples?
+
+```{r peak-location-barplot}
+lapply(mp_pc, function(x) table(x$peak_location))
+lapply(mp_pc, function(x) table(x$peak_location)/nrow(x)*100)
+
+pc_gene_sets <- list("WT" = gdf[gdf$gene_biotype == "protein_coding" & 
+                                  gdf$npeaks_WT > 0,"gene_id"],
+                     "6M" = gdf[gdf$gene_biotype == "protein_coding" & 
+                                  gdf$npeaks_6M > 0,"gene_id"],
+                     "RBDm" = gdf[gdf$gene_biotype == "protein_coding" & 
+                                  gdf$npeaks_RBDm > 0,"gene_id"])
+## number of pc genes per sample
+lapply(pc_gene_sets, length)
+
+## all target genes
+x <- lapply(mp_pc, function(x) table(x$peak_location))
+df <- data.frame(rbind(x[[1]], x[[2]], x[[3]]))
+df$sample <- names(mp_pc)
+df_long <- df %>% 
+  gather(key = "annotation", value = "peaks", -sample) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("WT", "6M", "RBDm")),
+                annotation = factor(annotation, 
+                                    levels = c("five_prime_utr", "exon", 
+                                               "intron", "three_prime_utr")))
+df_long
+## barplot with percentage of clusters per gene list and sample
+p <- ggplot(df_long, aes(x = sample, y = peaks, fill = annotation)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  theme_bw() +
+  theme(text = element_text(size = 14), legend.position = "bottom", 
+        legend.direction="horizontal", legend.box = "horizontal", 
+        plot.title = element_text(hjust = 0.5)) 
+p
+svg(here("analysis", "clip5", "figures", "pc_peak_location_all.svg"))
+p; dev.off()
+
+## Shared targets of WT and 6M
+shared <- pc_gene_sets[["WT"]][pc_gene_sets[["WT"]] %in% pc_gene_sets[["6M"]]]
+length(shared)
+x <- lapply(mp_pc[c("WT", "6M")], function(x) {
+  z <- x[x$gene_id %in% shared,]
+  table(z$peak_location)
+  })
+
+df <- data.frame(rbind(x[[1]], x[[2]]))
+df$sample <- c("WT", "6M")
+df_long <- df %>% 
+  gather(key = "annotation", value = "peaks", -sample) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("WT", "6M")),
+                annotation = factor(annotation, 
+                                    levels = c("five_prime_utr", "exon", 
+                                               "intron", "three_prime_utr")))
+df_long
+## barplot with percentage of clusters per gene list and sample
+p <- ggplot(df_long, aes(x = sample, y = peaks, fill = annotation)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  theme_bw() +
+  theme(text = element_text(size = 14), legend.position = "bottom", 
+        legend.direction="horizontal", legend.box = "horizontal", 
+        plot.title = element_text(hjust = 0.5)) 
+p
+svg(here("analysis", "clip5", "figures", "pc_peak_location_WT_6M.svg")); 
+p; dev.off()
+
+## shared targets of WT and RBDm
+shared <- pc_gene_sets[["WT"]][pc_gene_sets[["WT"]] %in% pc_gene_sets[["RBDm"]]]
+length(shared)
+x <- lapply(mp_pc[c("WT", "RBDm")], function(x) {
+  z <- x[x$gene_id %in% shared,]
+  table(z$peak_location)
+  })
+
+df <- data.frame(rbind(x[[1]], x[[2]]))
+df$sample <- c("WT", "RBDm")
+df_long <- df %>% 
+  gather(key = "annotation", value = "peaks", -sample) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("WT", "RBDm")),
+                annotation = factor(annotation, 
+                                    levels = c("five_prime_utr", "exon", 
+                                               "intron", "three_prime_utr")))
+df_long
+## barplot with percentage of clusters per gene list and sample
+p <- ggplot(df_long, aes(x = sample, y = peaks, fill = annotation)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  theme_bw() +
+  theme(text = element_text(size = 14), legend.position = "bottom", 
+        legend.direction="horizontal", legend.box = "horizontal", 
+        plot.title = element_text(hjust = 0.5)) 
+p
+svg(here("analysis", "clip5", "figures", "pc_peak_location_WT_RBDm.svg")); 
+p; dev.off()
+
+## unique targets of WT, 6M and RBDm
+wt_unique <- pc_gene_sets[["WT"]][!pc_gene_sets[["WT"]] %in% pc_gene_sets[["6M"]] &
+                                 !pc_gene_sets[["WT"]] %in% pc_gene_sets[["RBDm"]]]
+length(wt_unique)
+df <- data.frame(table(mp_pc[["WT"]][mp_pc[["WT"]]$gene_id %in% wt_unique, "peak_location"]))
+colnames(df) <- c("annotation", "peaks")
+df$sample <-"WT"
+df <- df %>% dplyr::mutate(annotation = factor(annotation, 
+                                               levels = c("five_prime_utr", "exon", 
+                                               "intron", "three_prime_utr")))
+## barplot with percentage of clusters per gene list and sample
+p <- ggplot(df, aes(x = sample, y = peaks, fill = annotation)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  theme_bw() +
+  theme(text = element_text(size = 14), legend.position = "bottom", 
+        legend.direction="horizontal", legend.box = "horizontal", 
+        plot.title = element_text(hjust = 0.5)) 
+p
+svg(here("analysis", "clip5", "figures", "pc_peak_location_WT_unique.svg")); 
+p; dev.off()
+
+## 6M unique
+sixm_unique <- pc_gene_sets[["6M"]][!pc_gene_sets[["6M"]] %in% pc_gene_sets[["WT"]] &
+                                 !pc_gene_sets[["6M"]] %in% pc_gene_sets[["RBDm"]]]
+length(sixm_unique)
+df <- data.frame(table(mp_pc[["6M"]][mp_pc[["6M"]]$gene_id %in% sixm_unique, "peak_location"]))
+colnames(df) <- c("annotation", "peaks")
+df$sample <-"6M"
+df <- df %>% dplyr::mutate(annotation = factor(annotation, 
+                                               levels = c("five_prime_utr", "exon", 
+                                               "intron", "three_prime_utr")))
+## barplot with percentage of clusters per gene list and sample
+p <- ggplot(df, aes(x = sample, y = peaks, fill = annotation)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  theme_bw() +
+  theme(text = element_text(size = 14), legend.position = "bottom", 
+        legend.direction="horizontal", legend.box = "horizontal", 
+        plot.title = element_text(hjust = 0.5)) 
+p
+svg(here("analysis", "clip5", "figures", "pc_peak_location_6M_unique.svg")); 
+p; dev.off()
+
+
+## RBDm unique
+rbdm_unique <- pc_gene_sets[["RBDm"]][!pc_gene_sets[["RBDm"]] %in% pc_gene_sets[["WT"]] &
+                                 !pc_gene_sets[["RBDm"]] %in% pc_gene_sets[["6M"]]]
+length(rbdm_unique)
+df <- data.frame(table(mp_pc[["RBDm"]][mp_pc[["RBDm"]]$gene_id %in% rbdm_unique, "peak_location"]))
+colnames(df) <- c("annotation", "peaks")
+df$sample <-"RBDm"
+df <- df %>% dplyr::mutate(annotation = factor(annotation, 
+                                               levels = c("five_prime_utr", "exon", 
+                                               "intron", "three_prime_utr")))
+## barplot with percentage of clusters per gene list and sample
+p <- ggplot(df, aes(x = sample, y = peaks, fill = annotation)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  theme_bw() +
+  theme(text = element_text(size = 14), legend.position = "bottom", 
+        legend.direction="horizontal", legend.box = "horizontal", 
+        plot.title = element_text(hjust = 0.5)) 
+p
+svg(here("analysis", "clip5", "figures", "pc_peak_location_RBDm_unique.svg")); 
+p; dev.off()
+```
+
+
+```{r}
+sessionInfo()
+```
