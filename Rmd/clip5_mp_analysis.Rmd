@@ -30,6 +30,7 @@ library(ggpubr)
 library(Biostrings)
 library(ggrepel)
 library(tidyr)
+library(RColorBrewer)
 ```
 
 # Data import
@@ -87,6 +88,8 @@ names(mp_an) <- names(mp)
 lapply(mp_an, nrow)
 ## number of target genes
 lapply(mp_an, function(x) x$gene_id %>% unique %>% length)
+
+saveRDS(mp, here("Rmd", "rds", "clip5_mp.rds"))
 ```
 
 ## Filter target genes based on peak location
