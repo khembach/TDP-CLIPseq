@@ -1,0 +1,820 @@
+---
+title: "Identification of characteristic mutations in peaks"
+author: "Katharina Hembach"
+date: "24.06.2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+  
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")),
+                      warning = FALSE, message = FALSE)
+```
+
+
+### Load packages
+```{r, message = FALSE}
+library(here)
+library(Rsamtools)
+library(rtracklayer)
+library(dplyr)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(eulerr)
+library(ggplot2)
+library(GenomicFeatures)
+library(ggrepel)
+library(ggpubr)
+library(stringr)
+```
+
+# Load data
+```{r load-files}
+mp <- readRDS(here("Rmd", "rds", "mp.rds"))
+## each peak get's a number as ID
+mp <- lapply(mp, function(x){
+  x$ID <- 1:length(x)
+  x
+})
+lengths(mp)
+
+## convert peaks to Ensembl annotation
+mp <- lapply(mp, function(x){seqlevelsStyle(x) <- "Ensembl"; x})
+
+## 
+samples <- names(mp)
+bams <- lapply(samples, function(x) 
+  list.files(here("output", "BAM_deduplicated"), 
+             pattern = paste0(".*", x, "2*_deduplicated.r2.bam$")))
+names(bams) <- samples
+
+## reference genome
+genome <- BSgenome.Hsapiens.UCSC.hg38
+seqlevelsStyle(genome) <- "Ensembl"
+## gene annotations
+gtf_file <- here("reference", "Homo_sapiens.GRCh38.98_snoDB.sorted.gtf")
+gtf <- import(gtf_file)
+genes <- gtf[gtf$type =="gene"]
+```
+
+# Compute pileup
+
+We generate pileup tables for each bam file and the corresponding peak locations. The pileup is used to identify the location and frequency of mutations (including deletions).
+
+
+```{r pileup-mut-table}
+##TODO: exclude start of reads from pileup, because they show massively increased mutations rates! (first 3 nucleotides)
+## try query_bin argument: query_bins=c(0, 4, Inf) --> count first 3 bases separately from the rest of the read
+## --> we don't use the first 3 bases and instead only require 2 mutations per position
+
+tabs_ref <- lapply(samples,function(x) NULL)  %>% setNames(samples)
+min_allel_depth <- 2
+
+for(s in samples){
+  sbp <- ScanBamParam(which = mp[[s]])
+  ## require at least 3 reads with any mutation per position
+  ## show all mutations with at least 1 supporting read
+  pp <- PileupParam(max_depth = 30000, include_deletions = TRUE, 
+                    min_nucleotide_depth=1, min_minor_allele_depth = min_allel_depth,
+                    query_bins=c(4, Inf))
+  ## compute pileup for both of the replicates
+  pu <- list("rep1" = pileup(here("output", "BAM_deduplicated", bams[[s]][1]), 
+              index = here("output", "BAM_deduplicated", paste0(bams[[s]][1], ".bai")),
+              scanBamParam=sbp,
+              pileupParam=pp),
+             "rep2" = pileup(here("output", "BAM_deduplicated", bams[[s]][2]), 
+              index = here("output", "BAM_deduplicated", paste0(bams[[s]][2], ".bai")),
+              scanBamParam=sbp,
+              pileupParam=pp))
+  lapply(pu, dim)
+
+  ## we merge the two replicates into one table, ordered by location
+  pu_merge <- rbind(pu[[1]], pu[[2]])
+  pu_merge[order(pu_merge$seqnames, pu_merge$pos),]
+  
+  ## TODO:should we also include positions around the peaks? Or require that the mutation is inside?
+  
+  ## table with the count of each nucleotide & deletions per position (seqname:pos)
+  # tab <- xtabs(count ~ pos + nucleotide, pu)
+  
+  ## table per chromosome
+  # tab <- xtabs(count ~ paste0(seqnames, ":", pos) + nucleotide, pu)
+  tabs <- lapply(unique(pu_merge$seqnames), function(x) {
+      tmp <- xtabs(count ~ paste0(pos, ":", strand) + nucleotide, pu_merge[pu_merge$seqnames == x,])
+      tmp <- as.data.frame.matrix(tmp)
+      ## add strand as new column
+      pos_strand <- str_split(rownames(tmp), ":", simplify = TRUE)
+      tmp$pos <- as.integer(pos_strand[,1])
+      tmp$strand <- pos_strand[,2]
+      tmp
+  })
+  names(tabs) <- unique(pu_merge$seqnames)
+  
+  # ## how many mutation sites per chromosome
+  # lapply(tabs, nrow)  %>% unlist
+  # ## how many peaks per chromosome
+  # table(seqnames(mp[[s]]))
+  # 
+  # ## how are the number of peaks and the number of mutations correlated?
+  # print(plot(lapply(tabs, nrow) %>% unlist, as.vector(table(seqnames(mp[[s]])))))
+  
+  ## take the reference base and compare the counts of reference to all other counts per row
+  ## --> mutation frequency of position
+  ## --> filter out all positions with > 50% mutation, they might be wrong mappings (start or read) or actual SNPs in our HEK cells.
+  
+ 
+  tabs_ref[[s]] <- lapply(names(tabs), function(chr){
+    ref_base <- getSeq(genome, 
+                        GRanges(seqnames = chr, 
+                                range = IRanges(tabs[[chr]]$pos, tabs[[chr]]$pos),
+                                strand = tabs[[chr]]$strand))
+    ## get count of ref for each position
+    ref_count <- as.vector(tabs[[chr]][,5]) # N
+    ind <- which(ref_base == "A")
+    ref_count[ind] <- tabs[[chr]][ind, 1] # A
+    ind <- which(ref_base == "C")
+    ref_count[ind] <- tabs[[chr]][ind, 2] # C
+    ind <- which(ref_base == "G")
+    ref_count[ind] <- tabs[[chr]][ind, 3] # G
+    ind <- which(ref_base == "T")
+    ref_count[ind] <- tabs[[chr]][ind, 4] # T
+    ## frequency of reference = #ref/total counts
+    ## frequency of minor alleles = 1-ref_freq
+    res <- tabs[[chr]]
+    res$ref_freq <- ref_count/as.vector(rowSums(res[,1:8]))
+    res
+  })
+  names(tabs_ref[[s]]) <- names(tabs)
+}
+```
+
+
+```{r filter-mut-pos}
+## summary of reference frequence per sample
+lapply(tabs_ref[["RBDm"]], function(x) summary(x$ref_freq))
+lapply(tabs_ref[["6M"]], function(x) summary(x$ref_freq)) 
+lapply(tabs_ref[["WT"]], function(x) summary(x$ref_freq))
+lapply(tabs_ref, function(x) lapply(x, function(y) nrow(y)))
+
+## we only keep the positions with ref_freq > 0.5, 
+## because more mutations might indicate actual SNPs or mapping errors
+tabs_ref_fil <- lapply(tabs_ref, function(s) lapply(s, function(chr) {
+  chr[chr$ref_freq >= 0.5,]
+  # if(nrow(tmp) == 0){
+  # return(NULL)
+  # }
+  # tmp
+  }))
+## remove chromosomes without mutation sites
+tabs_ref_fil <- lapply(tabs_ref_fil, function(s)
+  s[sapply(s, function(x) nrow(x) > 0)])
+
+## number of positions that are kept
+lapply(tabs_ref, function(s) unlist(lapply(s, function(chr) {
+  sum(chr$ref_freq>= 0.5)
+  })) %>% sum)
+
+## how many peaks have at least one mutated position?
+## GRanges with the mutated positions per sample
+mut_pos <- lapply(tabs_ref_fil, function(s) 
+  unlist(GRangesList(lapply(names(s), function(chr){
+    GRanges(seqnames = chr, range = IRanges(start = s[[chr]]$pos, 
+                                            end = s[[chr]]$pos), 
+            strand = s[[chr]]$strand)
+    
+  })))
+)
+
+## match the mut positions with the peaks
+mut_pos <- lapply(names(mut_pos), function(x) {
+  olap <- findOverlaps(mut_pos[[x]], mp[[x]], ignore.strand=FALSE)
+  mut_pos[[x]]$ID[queryHits(olap)] <- mp[[x]]$ID[subjectHits(olap)]
+  mut_pos[[x]]
+    })
+names(mut_pos) <- names(tabs_ref_fil)
+lapply(mut_pos, function(x) x$ID %>% unique %>% length)
+lengths(mp)
+
+## percentage of peaks that have at least one mutation
+lapply(names(mp), function(x) 
+  mut_pos[[x]]$ID %>% unique %>% length/length(mp[[x]])*100)
+
+lapply(names(mut_pos), function(x) 
+  export(mut_pos[[x]], here("analysis", "filtered_mp", "BED", 
+                    paste0("mutant_pos_min_", min_allel_depth, "_reads_", x, ".bed"))))
+```
+
+
+# Cluster mutations
+
+We cluster the mutations that are at most 10 bp apart.
+
+```{r group-mutations}
+## merge all mutations which are at max 10 bp apart
+max_gap <- 10
+mut_cluster <- lapply(mut_pos, function(x) reduce(x, min.gapwidth=max_gap + 1))
+lengths(mut_cluster)
+
+lapply(names(mut_cluster), function(x) 
+  export(mut_cluster[[x]], here("analysis", "filtered_mp", "BED", 
+                    paste0("mutant_cluster_dist_", max_gap,"_min_", 
+                           min_allel_depth, "_reads_", x, ".bed"))))
+```
+ 
+# Target genes
+
+We annotate each mutation cluster with the overlapping gene(s).
+
+```{r annotate-clusters, warning = FALSE}
+## each xl get's a number as ID
+mut_cluster <- lapply(mut_cluster, function(x){
+  x$ID <- 1:length(x)
+  x
+})
+
+clus_an <- lapply(names(mut_cluster), function(x) {
+  olap <- findOverlaps(mut_cluster[[x]], genes, ignore.strand = FALSE)  
+  data.frame(cluster_id = mut_cluster[[x]][queryHits(olap)]$ID, 
+             gene_id = genes[subjectHits(olap)]$gene_id)
+})
+names(clus_an) <- names(mut_cluster)
+lapply(clus_an, nrow)
+## number of target genes
+lapply(clus_an, function(x) x$gene_id %>% unique %>% length)
+```
+
+
+## Filter target genes based on cluster location
+
+We filter out protein coding genes and spliced lncRNAs where all clusters overlaps with small RNAs, because we saw in IGV that all these examples show now evidence of actual binding to the long genes.
+
+For all protein coding genes, if RBDm clusters are exclusively present in regions overlapping to small RNA genes, it gets reassigned to that gene and the annotation to the protein-coding gene is removed.
+```{r identify-wrong-pc-target-genes}
+## we tested different overlap values and decided to use 70%
+to_filter <- lapply(names(clus_an), function(s) {
+  x <- clus_an[[s]]
+  g <- genes[genes$gene_id %in% x$gene_id]
+  ##seperate protein coding and long lncRNAs from short genes
+  pc <- g[g$gene_biotype == "protein_coding"]$gene_id
+  ## separate spliced from unspliced lncRNAs
+  lnc <- g[g$gene_biotype == "lncRNA"]$gene_id
+  g1 <- gtf[gtf$gene_id %in% lnc]
+  e <- g1[g1$type == "exon"]
+  sp <- split(e$exon_number, e$gene_id)
+  ## all lncRNAs with more than 1 exon
+  lnc_spl <- names(sp)[lengths(lapply(sp, unique)) > 1]
+  ## all spliced genes, that need to be checked for potential false positives
+  pc <- c(pc, g[g$gene_id %in% lnc_spl]$gene_id)
+  ## list of small RNAs that might cause the clusters in the long genes
+  ## ## except TEC, MT_rRNA, 
+  ## everything except the protein coding genes and pseudogenes
+  short <- g[!g$gene_biotype %in% c("protein_coding", "unprocessed_pseudogene", 
+                                "Mt_rRNA", "transcribed_processed_pseudogene", 
+                                "transcribed_unitary_pseudogene", 
+                                "transcribed_unprocessed_pseudogene", 
+                                "unprocessed_pseudogene", "TEC")]
+  ## remove the long lncRNAs
+  short <- short[!short$gene_id %in% pc]
+  ## go through  the list of genes and determine if all clusters overlap small RNAs
+  res <- lapply(pc, function(i) {
+    clusters <- x[x$gene_id ==i, "cluster_id"]
+    nr_olap <- countOverlaps(mut_cluster[[s]][mut_cluster[[s]]$ID %in% clusters], short,
+                             ignore.strand = FALSE)
+    if(all(nr_olap > 0)){ ## all clusters overlap at least one short RNA
+      return(i)
+    } 
+    return(NULL)
+  })
+  unique(unlist(res)) ## all genes that are no true targets
+})
+names(to_filter) <- names(clus_an)
+lengths(to_filter)
+```
+
+```{r filter-target-genes}
+# what are the filtered genes?
+lapply(to_filter, function(x){
+  g <- genes[genes$gene_id %in% x]
+  m <- match(x, g$gene_id)
+  data.frame(gene_id = x, gene_name = g[m]$gene_name, 
+             gene_biotype = g[m]$gene_biotype )
+  })
+lapply(to_filter, function(x) genes[genes$gene_id %in% x]$gene_name)
+
+## remove the wrong targets from the list
+nam <- names(clus_an)
+clus_an <- lapply(names(clus_an), function(x) {
+  clus_an[[x]] %>% dplyr::filter(!gene_id %in% to_filter[[x]])
+})
+names(clus_an) <- nam
+
+## number of target genes after filtering
+lapply(clus_an, function(x) {
+  length(unique(x$gene_id))})
+
+saveRDS(clus_an, here("Rmd", "rds", "clus_an.rds"))
+```
+
+# Target genes
+
+We need a table with all target genes and the number of clusters per gene.
+
+```{r gdf}
+## data.frame with all target genes
+gdf <- as.data.frame(genes[genes$gene_id %in% 
+    (lapply(clus_an, function(x) x$gene_id %>% unique) %>% unlist %>% unique)]) %>% 
+  dplyr::select(seqnames, start, end, strand, gene_id, gene_name, gene_biotype)
+  
+## add the number of clusters per group
+for(i in names(clus_an)){
+  xlcount <- clus_an[[i]] %>% dplyr::group_by(gene_id) %>% dplyr::summarise(n = n())
+  m <- match(gdf$gene_id, xlcount$gene_id)
+  cname <- paste0("nclusters_", i)
+  gdf[,cname] <- xlcount$n[m]
+  gdf[is.na(gdf[,cname]), cname] <- 0
+}
+
+## sort according to number of clusters
+gdf <- gdf %>% dplyr::arrange(desc(nclusters_WT))
+gdf %>% head
+gdf %>% dplyr::arrange(desc(nclusters_6M)) %>% head
+gdf %>% dplyr::arrange(desc(nclusters_RBDm)) %>% head
+
+## distribution of gene types
+gdf$gene_biotype %>% table
+## we remove pseudogenes
+gdf <- gdf %>% dplyr::filter(!gene_biotype %in% 
+    c("processed_pseudogene", "rRNA_pseudogene", 
+      "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene", 
+      "transcribed_unprocessed_pseudogene", "unprocessed_pseudogene", "TEC"))
+gdf$gene_biotype %>% table
+nrow(gdf)
+
+## genes with 6M peaks but 0 WT peak
+gdf %>% dplyr::arrange(desc(nclusters_6M)) %>% 
+  dplyr::filter(nclusters_WT == 0) %>% 
+  head
+
+## bound in WT and RBDm, but not 6M
+gdf %>% dplyr::filter(nclusters_6M == 0 & nclusters_WT > 0 & nclusters_RBDm > 0) %>% 
+  head
+
+write.table(gdf, here("analysis", "filtered_mp", 
+                      "gene_mutation_cluster_count_merge_peaks_filtered.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+
+# Venn diagram
+
+Venn and euler diagram of the genes with at least one peak
+
+```{r venn-diagram}
+gene_list <- list("WT" = gdf$gene_id[gdf$nclusters_WT>0], 
+                  "6M" = gdf$gene_id[gdf$nclusters_6M>0], 
+                  "RBDm" = gdf$gene_id[gdf$nclusters_RBDm>0])
+euler_diag <- euler(gene_list, shape = "circle")
+venn_diag <- venn(gene_list)
+
+eulerr_options(labels = list(fontsize = 20), 
+               quantities = list(fontsize = 20, font = 2), 
+               fills = list(alpha = 0.5),
+               padding = unit(0.6, "lines"))
+p <- plot(euler_diag, font=1, 
+     fills=c("#117733", "#882255", "steelblue3"),
+     edges=c("#117733", "#882255", "steelblue3"),
+     labels = list(col = c("#117733", "#882255", "steelblue4")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+svg(here("analysis", "filtered_mp", "figures", "euler.svg")); p; dev.off()
+
+p <- plot(venn_diag,font=1, 
+     fills=c("#117733", "#882255", "steelblue3"),
+     edges=c("#117733", "#882255", "steelblue3"),
+     labels = list(col = c("#117733", "#882255", "steelblue4")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+svg(here("analysis", "filtered_mp", "figures", "venn.svg")); p; dev.off()
+```
+
+What are the genes with clusters in only the 6M or RBDm samples?
+
+```{r unique_clusters}
+## 6M specific
+gdf %>% dplyr::filter(nclusters_WT == 0 & nclusters_RBDm == 0) %>% dplyr::pull(gene_name)
+
+## RBDm specific
+gdf %>% dplyr::filter(nclusters_WT == 0 & nclusters_6M == 0) %>% dplyr::pull(gene_name)
+```
+
+
+
+What is the mean number of XL sites in the unique and shared target genes?
+```{r}
+gdf %>% dplyr::filter(nclusters_WT == 0 & nclusters_RBDm == 0) %>% 
+  dplyr::pull(nclusters_6M) %>% summary
+gdf %>% dplyr::filter(nclusters_WT == 0 & nclusters_6M == 0) %>% 
+  dplyr::pull(nclusters_RBDm) %>% summary
+
+## How does it compare to the overall number of mutation clusters per gene?
+gdf %>% dplyr::filter(nclusters_6M > 0 ) %>% dplyr::pull(nclusters_6M) %>% summary
+gdf %>% dplyr::filter(nclusters_RBDm > 0 ) %>% dplyr::pull(nclusters_RBDm) %>% summary
+```
+
+
+# Hexamer enrichment in window surrounding clusters
+
+We center a window on the mutation site clusters and compute the oligomer enrichment.
+
+We only consider the gene annotation of the target genes per sample to avoid issues with overlapping genes. For all target genes, the sets of exonic, 3'UTR, 5'UTR and intronic regions are compiled.
+
+```{r prepare-annotation}
+# genes <- mp_an[["RBDm"]]$gene_id
+prep_an <- function(gtf, genes){
+  g <- gtf[gtf$gene_id %in% genes]
+  
+  exon <- g[g$type == "exon"] %>% unique
+  five_utr <- g[g$type == "five_prime_utr"] %>% unique
+  three_utr <- g[g$type == "three_prime_utr"] %>% unique
+
+  ## We remove all 3' and 5' UTR regions that overlap with any exons
+  exon_utr <- GenomicRanges::setdiff(exon, three_utr)
+  exon_unique <- GenomicRanges::setdiff(exon_utr, five_utr) %>% unique
+  # We remove 3'UTR regions that overlap with 5'UTR regions
+  three_utr_unique <- GenomicRanges::setdiff(three_utr, five_utr) %>% unique
+  anno <- GRangesList(exon = exon_unique, three_prime_utr = three_utr_unique, 
+             five_prime_utr = five_utr)
+  ## intron annotation
+  txdb <- makeTxDbFromGRanges(g)
+  introns <- unlist(intronsByTranscript(txdb))
+  ## remove the intronic parts that overlap with exons from other transcripts
+  anno[["intron"]] <- GenomicRanges::setdiff(introns, c(anno[["exon"]], 
+                                         anno[["three_prime_utr"]], 
+                                         anno[["five_prime_utr"]])) %>% reduce
+  ## reduce potentially overlapping ranges
+  lapply(anno, reduce)
+}
+
+sample_an <- lapply(names(clus_an), function(n) 
+  prep_an(gtf, clus_an[[n]]$gene_id %>% unique))
+names(sample_an) <- names(clus_an)
+
+lapply(sample_an, function(x) lapply(x, length))
+saveRDS(sample_an, here("Rmd", "rds", "sample_an_mutation_clusters.rds"))
+```
+
+
+```{r z-score-function-def}
+## for each sample
+## we place the window at a random position within each bg seq
+## we compute the oligomer counts
+## we repeat this 100 times, to generate a matrix with oligomer x 100 (oligomer count for each repetition)
+shuffled_oligomer_counts <- function(b, w_size, nolig = 6){
+  ## only keep the region that are at least as big as w_size
+  b <- b[lengths(b) >= w_size]
+  names(b) <- 1:length(b)
+  # random number between 0 and 1 is multiplied with sequence length to determine the start position of the shuffled window
+  starts <- floor(1 + runif(length(b)) * (lengths(b)-w_size + 1))
+  # subset the sequences according to random start coordinates
+  seq <- subseq(b, start = starts, end = starts + w_size - 1)
+  of <- oligonucleotideFrequency(seq, width = nolig, step = 1, 
+                                  simplify.as = "collapsed")
+}
+
+## given window size, peaks with position of peak center and overlapping annotation regions,
+## we can compute the oligomer occurrence in the peak windows
+## and we shuffle the windows in the annotation regions 100 timnes and 
+## also count the oligomers to compute the x-score per oligomer 
+oligomer_zscore <- function(wind_size = 41, clusters, sample_an, nolig = 6){
+  half_wind <- (wind_size-1)/2
+
+  ## Peak window regions
+  wind <- lapply(clusters, function(x) 
+    GRanges(seqnames(x), IRanges(start(x)-half_wind, end(x)+half_wind), 
+            strand = strand(x), ID = x$ID))
+  
+  ## Annotation regions overlapping with at least half of a window
+  sample_an_wind <- lapply(names(sample_an), function(x) 
+    lapply(sample_an[[x]], function(a) {
+      a[queryHits(findOverlaps(a, wind[[x]], minoverlap = half_wind+1))]
+    })
+  )
+  names(sample_an_wind) <- names(sample_an)
+  
+  ## genomic sequence of windows and annotation regions
+  wind_seq <- lapply(wind, function(x) getSeq(genome, x))
+  bg_seq <- lapply(sample_an_wind, function(x) 
+    GRangesList(x) %>% 
+      unlist %>% 
+      getSeq(x = genome, names = .))
+  
+  ## oligomer count in window
+  obs <- lapply(wind_seq, function(x) {
+    oligonucleotideFrequency(x, width = nolig, step = 1, 
+                                    simplify.as = "collapsed")
+  })
+  
+  ## oligomer count in shuffled windows
+  obs_sh <- lapply(names(bg_seq), function(x) {
+    obs_sh <- list()
+    for(i in 1:100){
+      obs_sh[[i]] <- shuffled_oligomer_counts(b = bg_seq[[x]], 
+                                              w_size = wind_size, nolig)
+    }
+    obs_sh <- bind_cols(obs_sh)
+    obs_sh
+  })
+  names(obs_sh) <- names(bg_seq)
+  
+  ## z-score
+  sh_params <- lapply(obs_sh, function(x) {
+      data.frame(mean = rowMeans(x), sd = apply(x, 1, sd))
+  })
+  
+  z_scores <- lapply(names(obs), function(x) {
+    (obs[[x]] - sh_params[[x]]$mean) / sh_params[[x]]$sd
+  })
+  names(z_scores) <- names(obs)
+  z_scores
+}
+
+## Plot the z-scores of two peak sets against each other 
+plot_oligomer <- function(dfz, xparam, yparam, i, label = "oligomer"){
+  lim <- c(min(dfz[, xparam[i]], dfz[, yparam[i]]), max(dfz[, xparam[i]], dfz[, yparam[i]]))
+  p <- ggplot(dfz, aes_string(x = xparam[i], y = yparam[i], label = label)) + 
+    geom_point(alpha = 0.3, col = "darkblue") +
+    theme_bw() + xlim(lim) + ylim(lim) + theme(aspect.ratio = 1) +
+    stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+    geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
+    geom_text_repel(data = rbind(dfz %>% 
+                      dplyr::arrange(desc(get(xparam[i]))) %>% 
+                      dplyr::slice(1:20),
+                      dfz %>% 
+                      dplyr::arrange(desc(get(yparam[i]))) %>% 
+                      dplyr::slice(1:20)) %>% 
+                      unique) 
+  print(p)
+}
+```
+
+
+# Z-score for different oligomer and window sizes
+
+## Pentamer & window 61
+
+What are the hexamers with the highest z-score per sample?
+
+```{r wind-61, warning = FALSE, message = FALSE}
+z_scores <- oligomer_zscore(wind_size = 31, mut_cluster, sample_an, nolig = 5)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTG"])
+lapply(z_scores, function(x) x["TGTGT"])
+```
+Are the top pentamers similar between samples?
+
+### Scatterplot {.tabset}
+
+```{r z-score-plots-61, results = "asis", message = FALSE}
+dfz <- data.frame(pentamer = names(z_scores[[1]]), 
+                  zscore_WT = z_scores[["WT"]],
+                  zscore_6M = z_scores[["6M"]], 
+                  zscore_RBDm = z_scores[["RBDm"]])
+xparam <- c("zscore_6M", "zscore_6M", "zscore_RBDm")
+yparam <- c("zscore_WT", "zscore_RBDm", "zscore_WT")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_oligomer(dfz, xparam, yparam, i, label = "pentamer")
+  cat("\n\n")
+}
+```
+
+
+## Hexamer & window 61
+
+What are the hexamers with the highest z-score per sample?
+
+```{r hexamer-wind-61, warning = FALSE, message = FALSE}
+z_scores <- oligomer_zscore(wind_size = 31, mut_cluster, sample_an, nolig = 6)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTGT"])
+lapply(z_scores, function(x) x["TGTGTG"])
+```
+Are the top pentamers similar between samples?
+
+### Scatterplot {.tabset}
+
+```{r hexamer-z-score-plots-61, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores[[1]]), 
+                  zscore_WT = z_scores[["WT"]],
+                  zscore_6M = z_scores[["6M"]], 
+                  zscore_RBDm = z_scores[["RBDm"]])
+xparam <- c("zscore_6M", "zscore_6M", "zscore_RBDm")
+yparam <- c("zscore_WT", "zscore_RBDm", "zscore_WT")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_oligomer(dfz, xparam, yparam, i, label = "hexamer")
+  cat("\n\n")
+}
+```
+
+
+
+# Peaks split by location
+
+We separate the protein coding and spliced lncRNAs from the noncoding RNAs and compare the hexamers enrichment in introns, exons and UTRs.
+We focus on the WT sample, because we first want to discover the known GU-repeat motif of intronic targets.
+
+```{r separate-pc-ncRNA}
+## we get the gene IDs for each of the subsets and prepare gene annotations for each of the sets.
+##seperate protein coding and long lncRNAs from the rest
+g <- gtf[gtf$gene_id %in% clus_an[["WT"]]$gene_id & gtf$type == "gene"]
+pc <- g[g$gene_biotype == "protein_coding"]$gene_id
+length(pc)
+## separate spliced from unspliced lncRNAs
+lnc <- g[g$gene_biotype == "lncRNA"]$gene_id
+length(lnc)
+g1 <- gtf[gtf$gene_id %in% lnc]
+e <- g1[g1$type == "exon"]
+sp <- split(e$exon_number, e$gene_id)
+## all lncRNAs with more than 1 exon
+lnc_spl <- names(sp)[lengths(lapply(sp, unique)) > 1]
+length(lnc_spl)
+## all spliced genes, that need to be checked for potential false positives
+pc <- c(pc, g[g$gene_id %in% lnc_spl]$gene_id)
+length(pc)
+## short RNAs
+short <- clus_an[["WT"]]$gene_id[!clus_an[["WT"]]$gene_id %in% pc] %>% unique
+length(short)
+
+length(short) + length(pc)
+length(unique(clus_an[["WT"]]$gene_id))
+```
+
+We prepare the annotation for the two gene sets
+
+```{r prep-ann-split}
+sample_an_pc <- prep_an(gtf, pc)
+sample_an_nc <- prep_an(gtf, short)
+sample_an_nc <- sample_an_nc[sapply(sample_an_nc, function(x) length(x) > 0)]
+```
+
+## window 61
+
+```{r wind-61-pc-nc, warning = FALSE, message = FALSE}
+hexamer_zscore_single_set <- function(wind_size = 41, clusters, sample_an){
+  half_wind <- (wind_size-1)/2
+  ## Cluster window regions
+  wind <- GRanges(seqnames(clusters), 
+                  IRanges(start(clusters)-half_wind, end(clusters)+half_wind), 
+                  strand = strand(clusters), ID = clusters$ID)
+  
+  ## Annotation regions overlapping with at least half of a window
+  sample_an_wind <- lapply(sample_an, function(a) {
+    a[queryHits(findOverlaps(a, wind, minoverlap = half_wind+1))]
+    })
+  ## genomice sequence of windows and annotation regions
+  wind_seq <- getSeq(genome, wind)
+  bg_seq <- sample_an_wind %>% 
+    GRangesList() %>% 
+    unlist %>% 
+    getSeq(x = genome, names = .)
+  ## hexamer count in window
+  obs <- oligonucleotideFrequency(wind_seq, width = 6, step = 1, 
+                                    simplify.as = "collapsed")
+  ## hexamer count in shuffled windows
+  obs_sh <- list()
+  for(i in 1:100){
+    obs_sh[[i]] <- shuffled_oligomer_counts(b = bg_seq, 
+                                            w_size = wind_size, nolig = 6)
+  }
+  obs_sh <- bind_cols(obs_sh)
+  
+  ## z-score
+  sh_params <- data.frame(mean = rowMeans(obs_sh), sd = apply(obs_sh, 1, sd))
+
+  (obs - sh_params$mean) / sh_params$sd
+}
+
+# separate pc from short genes
+cluster_ids_pc <- clus_an[["WT"]]$cluster_id[clus_an[["WT"]]$gene_id %in% pc]
+cluster_ids_nc <- clus_an[["WT"]]$cluster_id[clus_an[["WT"]]$gene_id %in% short]
+
+## protein coding and spliced  lncRNAs
+z_scores_pc <- hexamer_zscore_single_set(wind_size = 61, 
+                           mut_cluster[["WT"]][mut_cluster[["WT"]]$ID %in% cluster_ids_pc],
+                           sample_an_pc)
+summary(z_scores_pc)
+z_scores_pc[order(z_scores_pc)][1:20]
+z_scores_pc[order(z_scores_pc, decreasing = TRUE)][1:30]
+z_scores_pc["GTGTGT"]
+z_scores_pc["TGTGTG"]
+
+## ncRNAs
+z_scores_nc <- hexamer_zscore_single_set(wind_size = 61, 
+                           mut_cluster[["WT"]][mut_cluster[["WT"]]$ID %in% cluster_ids_nc],
+                           sample_an_nc)
+summary(z_scores_nc)
+z_scores_nc[order(z_scores_nc)][1:20]
+z_scores_nc[order(z_scores_nc, decreasing = TRUE)][1:30]
+z_scores_nc["GTGTGT"]
+z_scores_nc["TGTGTG"]
+```
+
+
+### Split cluster locations within pc genes
+
+
+```{r split-pc-peaks-location-61, message = FALSE}
+hexamer_zscore_split <- function(wind_size = 41, clusters, sample_an){
+  half_wind <- (wind_size-1)/2
+  ## cluster window regions
+  wind <- lapply(clusters, function(x) 
+    GRanges(seqnames(x), IRanges(start(x)-half_wind, end(x)+half_wind), 
+            strand = strand(x), ID = x$ID))
+  ## Annotation regions overlapping with at least half of a window
+  sample_an_wind <- lapply(names(sample_an), function(x) {
+      sample_an[[x]][queryHits(findOverlaps(sample_an[[x]], 
+                                            wind[[x]], 
+                                            minoverlap = half_wind+1))]
+    })
+  names(sample_an_wind) <- names(sample_an)
+  
+  ## genomice sequence of windows and annotation regions
+  wind_seq <- lapply(wind, function(x) getSeq(genome, x))
+  bg_seq <- lapply(sample_an_wind, function(x) 
+    GRangesList(x) %>% 
+      unlist %>% 
+      getSeq(x = genome, names = .))
+  ## hexamer count in window
+  obs <- lapply(wind_seq, function(x) {
+    oligonucleotideFrequency(x, width = 6, step = 1, 
+                                    simplify.as = "collapsed")
+  })
+  ## hexamer count in shuffled windows
+  obs_sh <- lapply(names(bg_seq), function(x) {
+    obs_sh <- list()
+    for(i in 1:100){
+      obs_sh[[i]] <- shuffled_oligomer_counts(b = bg_seq[[x]], 
+                                              w_size = wind_size, nolig = 6)
+    }
+    obs_sh <- bind_cols(obs_sh)
+    obs_sh
+  })
+  names(obs_sh) <- names(bg_seq)
+  
+  ## z-score
+  sh_params <- lapply(obs_sh, function(x) {
+      data.frame(mean = rowMeans(x), sd = apply(x, 1, sd))
+  })
+  
+  z_scores <- lapply(names(obs), function(x) {
+    (obs[[x]] - sh_params[[x]]$mean) / sh_params[[x]]$sd
+  })
+  names(z_scores) <- names(obs)
+  z_scores
+}
+
+cluster_split_pc <- lapply(sample_an_pc, function(a){
+  subsetByOverlaps(mut_cluster[["WT"]][mut_cluster[["WT"]]$ID %in% cluster_ids_pc], 
+                   a)
+})
+lapply(cluster_split_pc, length)
+
+z_scores_pc_split <- hexamer_zscore_split(wind_size = 61, cluster_split_pc, sample_an_pc)
+lapply(z_scores_pc_split, summary)
+lapply(z_scores_pc_split, function(x) x[order(x)][1:20])
+lapply(z_scores_pc_split, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores_pc_split, function(x) x["GTGTGT"])
+lapply(z_scores_pc_split, function(x) x["TGTGTG"])
+```
+
+
+#### Scatterplot {.tabset}
+
+```{r z-score-plots-split-pc, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores_pc_split[[1]]), 
+                  zscore_exon = z_scores_pc_split[["exon"]],
+                  zscore_3UTR = z_scores_pc_split[["three_prime_utr"]], 
+                  zscore_5UTR = z_scores_pc_split[["five_prime_utr"]],
+                  zscore_intron = z_scores_pc_split[["intron"]])
+
+xparam <- c("zscore_exon", "zscore_3UTR", "zscore_5UTR", "zscore_exon", "zscore_exon", "zscore_3UTR")
+yparam <- c("zscore_intron", "zscore_intron", "zscore_intron", "zscore_3UTR", "zscore_5UTR", "zscore_5UTR")
+
+for(i in 1:length(xparam)){
+  cat("##### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_oligomer(dfz, xparam, yparam, i, label = "hexamer")
+  cat("\n\n")
+}
+```
+
