@@ -29,6 +29,7 @@ library(ggrepel)
 library(ggpubr)
 library(stringr)
 library(RColorBrewer)
+library(GenomicAlignments)
 ```
 
 # Load data
@@ -99,16 +100,68 @@ for(s in samples){
 }
 ```
 
+We compute the fraction of reads with deletion, and remove positions with >50% deletions, these are either true deletions compared to the reference genome or positions with very low read coverage.
+```{r read-genome-coverage}
+## import BAM files to get genome read coverage
+if (!file.exists(here("Rmd", "rds", "clip5_BAM_coverage.rds"))) {
+  fs <- dir(path = here("output", "BAM_deduplicated_clip5"), pattern = "_R2_deduplicated.bam$", 
+            full.names = TRUE)
+  names(fs) <- str_extract(basename(fs), 
+                         "(?<=20200123.A-).*(?=_R2_deduplicated.bam)")
+  cov <- list()
+  for (sample in names(fs)){
+    ga <- readGAlignments(fs[sample])
+    cov[[sample]] <- coverage(ga)
+    rm(ga)
+  }
+  gc()
+  saveRDS(cov, here("Rmd", "rds", "clip5_BAM_coverage.rds"))
+} else{
+  cov <- readRDS(here("Rmd", "rds", "clip5_BAM_coverage.rds"))
+}
+```
 
-```{r deletion-pos}
+```{r add-del-perc}
 lapply(pu_res, function(x) lapply(x, nrow))
 
-## check the number of reads supporting each deletion in the two replicates and filter positions
-## that only have deletions in one replicate but not the other!
-pu_res[["RBDm"]][["rep1"]] %>% head
-pu_res[["RBDm"]][["rep2"]] %>% head
+pu_res_cov <- list() 
+for(i in names(pu_res)){
+  m <- match(i, names(cov))
+  a <- pu_res[[i]]
+  a[["rep1"]]$nreads <- cov[[m]][GRanges(seqnames = a[["rep1"]]$seqnames, 
+                               range = IRanges(start = a[["rep1"]]$pos, 
+                                               end = a[["rep1"]]$pos), 
+                               strand = a[["rep1"]]$strand)] %>% 
+    unlist %>% as.vector 
+  a[["rep1"]]$del_frac <- a[["rep1"]]$count / a[["rep1"]]$nreads 
+  a[["rep2"]]$nreads <- cov[[m+1]][GRanges(seqnames = a[["rep2"]]$seqnames, 
+                               range = IRanges(start = a[["rep2"]]$pos, 
+                                               end = a[["rep2"]]$pos), 
+                               strand = a[["rep2"]]$strand)] %>% 
+    unlist %>% as.vector
+  a[["rep2"]]$del_frac <- a[["rep2"]]$count / a[["rep2"]]$nreads 
+  pu_res_cov[[i]] <- a
+}
+lapply(pu_res_cov, function(x) lapply(x, function(y) summary(y$del_frac)))
+## fraction of positions with > 50% deletions
+lapply(pu_res_cov, function(x) lapply(x, function(y) sum(y$del_frac > 0.5)/nrow(y)))
+## what is the number of reads at these positions?
+lapply(pu_res_cov, function(x) lapply(x, function(y) y[y$del_frac > 0.5, "nreads"] %>% summary))
 
-pu_merge <- lapply(pu_res, function(x){
+## remove all positions with > 50% deletions
+pu_res_cov <- lapply(pu_res_cov, function(x) lapply(x, function(y) y[y$del_frac <= 0.5,]))
+lapply(pu_res_cov, function(x) lapply(x, nrow))
+```
+
+
+
+```{r deletion-pos}
+# ## check the number of reads supporting each deletion in the two replicates and filter positions
+# ## that only have deletions in one replicate but not the other!lapply(pu_res,nrow)
+pu_res_cov[["RBDm"]][["rep1"]] %>% head
+pu_res_cov[["RBDm"]][["rep2"]] %>% head
+
+pu_merge <- lapply(pu_res_cov, function(x){
   x[["rep1"]] %>% 
   full_join(x[["rep2"]], by = c("seqnames", "pos", "strand", "nucleotide"), 
             suffix = c("1", "2")) 
@@ -129,6 +182,11 @@ for(s in names(pu_merge)){
   ## positions with deletions supported by at least 2 reads in both replicates
   print(paste0(">=2 reads in both reps: ", 
           pu_merge[[s]] %>% dplyr::filter(count1 > 1 & count2 > 1) %>% nrow))
+  
+  ## positions with at least 4 deletions independent of replicates
+  print(paste0(">=4 reads: ", 
+          pu_merge[[s]] %>% dplyr::filter(count1  + count2 >= 4) %>% nrow))
+ 
 }
 ```
 
@@ -146,12 +204,20 @@ lapply(pu_filtered, function(x) summary(x$count1 + x$count2))
 ```
 
 
+## Positions with high number of deletions
+What are the positions with many deletions? Are they common between samples?
+```{r pos-high-del-count}
+## how many positions have more than 100 reads?
+lapply(pu_filtered, function(x) x[rowSums(x[,c("count1", "count2")]) >= 25,])
+```
+
+
 # Cluster deletions
 
 We cluster the mutations that are at most 10 bp apart.
 
 ```{r group-mutations}
-## create GRanges with deletionn positions
+## create GRanges with deletion positions
 gr <- lapply(pu_filtered, function(x) 
   GRanges(seqnames = x$seqnames, range = IRanges(start = x$pos, end = x$pos), 
           strand = x$strand, count1 = x$count1, count2 = x$count2))
@@ -160,7 +226,6 @@ gr <- lapply(pu_filtered, function(x)
 lapply(names(gr), function(x) 
   export(gr[[x]], here("analysis", "clip5", "BED", 
                     paste0("deletion_pos_min_3reads_", x, ".bed"))))
-
 
 ## merge all mutations which are at max 10 bp apart
 max_gap <- 10
@@ -182,11 +247,9 @@ We annotate each deletion cluster with the overlapping gene(s).
 ## remove deletion sites on chromosome patches
 del_cluster <- lapply(del_cluster, function(x) 
   x[seqnames(x) %in% seqnames(genome)])
-
 del_cluster <- lapply(del_cluster, function(x) {
  seqlevels(x) <- seqlevelsInUse(x)
  x})
-
 ## each xl get's a number as ID
 del_cluster <- lapply(del_cluster, function(x){
   x$ID <- 1:length(x)
@@ -210,7 +273,6 @@ lapply(clus_an, function(x) x$gene_id %>% unique %>% length)
 We filter out protein coding genes and spliced lncRNAs where all clusters overlap with small RNAs, because we saw in IGV that all these examples show now evidence of actual binding to the long genes.
 
 ```{r identify-wrong-pc-target-genes}
-## we tested different overlap values and decided to use 70%
 to_filter <- lapply(names(clus_an), function(s) {
   x <- clus_an[[s]]
   g <- genes[genes$gene_id %in% x$gene_id]
@@ -509,7 +571,7 @@ plot_oligomer <- function(dfz, xparam, yparam, i, label = "oligomer"){
   p <- ggplot(dfz, aes_string(x = xparam[i], y = yparam[i], label = label)) + 
     geom_point(alpha = 0.3, col = "darkblue") +
     theme_bw() + xlim(lim) + ylim(lim) + theme(aspect.ratio = 1) +
-    stat_cor(method = "pearson", label.x.npc = "center", label.y.npc = "bottom") +
+    stat_cor(method = "pearson", label.x.npc = "center", label.y.npc = "top") +
     geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
     geom_text_repel(data = rbind(dfz %>% 
                       dplyr::arrange(desc(get(xparam[i]))) %>% 
@@ -820,7 +882,6 @@ gene_sets <- list(WT = gdf %>% dplyr::filter(nclusters_WT > 0),
                   "6M" = gdf %>% dplyr::filter(nclusters_6M > 0),
                   RBDm = gdf %>% dplyr::filter(nclusters_RBDm > 0))
 lapply(gene_sets, nrow)
-
 ## all target genes unique to WT, shared between WT and 6M 
 ## or shared between WT, 6M and RBDm
 gene_sets_wt <- list(WT = gdf %>% 
@@ -835,7 +896,6 @@ lapply(gene_sets_wt, nrow)
 ```{r gene-biotype-distr}
 # number of genes
 lapply(gene_sets, function(x) x$gene_biotype %>% table)
-
 ## We summarize the small biotype categories because we need equal categories for the Chi-squared test and because the frequencies have should be >5.%
 ## we keep lncRNA, protein_coding,  snoRNA, 
 ## and merge scaRNA, snRNA,  misc_RNA, miRNA, Mt_rRNA, ribozyme, rRNA into the category "other"
@@ -983,3 +1043,212 @@ pairwise.wilcox.test(df$gene_length, df$gene_set, p.adjust.method = "BH")
 ```
 
  
+# Comparison with peaks
+
+Are the deletion sites located within peaks?
+```{r read-mp}
+mp <- readRDS(here("Rmd", "rds", "clip5_mp.rds"))
+lapply(mp, length)
+
+for(i in names(del_cluster)) {
+  print(i)
+  nclus <- del_cluster[[i]] %>% length
+  olaps <- subsetByOverlaps(del_cluster[[i]], mp[[i]], ignore.strand = FALSE) %>% 
+    length
+  print(paste0("number of del clusters: ", nclus))
+  print(paste0("number of overlaps: ", olaps))
+  print(paste0("perc of dels within peak: ", olaps/nclus*100))
+  
+  npeaks <- mp[[i]] %>% length
+  olaps <- subsetByOverlaps(mp[[i]], del_cluster[[i]], ignore.strand = FALSE) %>% 
+    length
+  print(paste0("number of peaks: ", npeaks))
+  print(paste0("number of overlaps: ", olaps))
+  print(paste0("perc of peaks with del cluster: ", olaps/npeaks*100))
+  
+  gr <- GRanges(seqnames = pu_merge[[i]]$seqnames, 
+                               range = IRanges(start = pu_merge[[i]]$pos, 
+                                               end = pu_merge[[i]]$pos), 
+                               strand = pu_merge[[i]]$strand)
+
+  nclus <- gr %>% length
+  olaps <- subsetByOverlaps(gr, mp[[i]], ignore.strand = FALSE) %>% 
+    length
+  print(paste0("number of del sites: ", nclus))
+  print(paste0("number of overlaps: ", olaps))
+  print(paste0("perc of dels within peak: ", olaps/nclus*100))
+  
+  npeaks <- mp[[i]] %>% length
+  olaps <- subsetByOverlaps(mp[[i]], gr, ignore.strand = FALSE) %>% 
+    length
+  print(paste0("number of peaks: ", npeaks))
+  print(paste0("number of overlaps: ", olaps))
+  print(paste0("perc of peaks with del site: ", olaps/npeaks*100))
+}
+```
+
+
+
+## Hexamer enrichment of del clusters within peaks
+
+```{r peak-del-clusters-hexamer}
+## subset del clusters within peaks
+del_cluster_mp <- lapply(names(del_cluster), function(x) {
+  subsetByOverlaps(del_cluster[[x]], mp[[x]], ignore.strand = FALSE) 
+  })
+names(del_cluster_mp) <- names(del_cluster)
+
+clus_an_mp <- lapply(names(clus_an), function(x) 
+  clus_an[[x]][clus_an[[x]]$cluster_id %in% del_cluster_mp[[x]]$ID,])
+names(clus_an_mp) <- names(clus_an)
+
+sample_an_mp <- lapply(names(clus_an_mp), function(n) 
+  prep_an(gtf, clus_an_mp[[n]]$gene_id %>% unique))
+names(sample_an_mp) <- names(clus_an_mp)
+
+## all del clusters within peaks
+z_scores <- oligomer_zscore(wind_size = 61, del_cluster_mp, sample_an_mp, nolig = 6)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTGT"])
+lapply(z_scores, function(x) x["TGTGTG"])
+```
+
+
+
+## Hexamer enrichment of all del sites within peaks
+
+First, we need to cluster the deletions within peaks.
+
+```{r cluster-peak-dels}
+## create GRanges with deletion positions
+gr <- lapply(pu_merge, function(x) 
+  GRanges(seqnames = x$seqnames, range = IRanges(start = x$pos, end = x$pos), 
+          strand = x$strand, count1 = x$count1, count2 = x$count2))
+
+## filter all del pos within peaks
+pu_merge_mp <- lapply(names(gr), function(x) {
+  subsetByOverlaps(gr[[x]], mp[[x]], ignore.strand = FALSE) 
+  })
+names(pu_merge_mp) <- names(gr)
+
+
+## save deletions positions
+lapply(names(pu_merge_mp), function(x) 
+  export(pu_merge_mp[[x]], here("analysis", "clip5", "BED", 
+                    paste0("all_deletion_pos_within_mp_", x, ".bed"))))
+
+## merge all mutations which are at max 10 bp apart
+max_gap <- 10
+
+all_del_clus_mp <- lapply(pu_merge_mp, function(x) reduce(x, min.gapwidth=max_gap + 1))
+lengths(all_del_clus_mp)
+
+lapply(names(all_del_clus_mp), function(x) 
+  export(all_del_clus_mp[[x]], here("analysis", "clip5", "BED", 
+                                paste0("all_deletion_cluster_dist_", max_gap, 
+                                       "_within_mp_", x, ".bed"))))
+```
+Annotate clusters
+
+```{r annotate-all-del-mp}
+## each xl get's a number as ID
+all_del_clus_mp <- lapply(all_del_clus_mp, function(x){
+  x$ID <- 1:length(x)
+  x
+})
+
+all_clus_an_mp <- lapply(names(all_del_clus_mp), function(x) {
+  olap <- findOverlaps(all_del_clus_mp[[x]], genes, ignore.strand = FALSE)  
+  data.frame(cluster_id = all_del_clus_mp[[x]][queryHits(olap)]$ID, 
+             gene_id = genes[subjectHits(olap)]$gene_id)
+})
+names(all_clus_an_mp) <- names(all_del_clus_mp)
+lapply(all_clus_an_mp, nrow)
+## number of target genes
+lapply(all_clus_an_mp, function(x) x$gene_id %>% unique %>% length)
+```
+
+```{r identify-wrong-pc-target-genes-mp}
+to_filter_mp <- lapply(names(all_clus_an_mp), function(s) {
+  x <- all_clus_an_mp[[s]]
+  g <- genes[genes$gene_id %in% x$gene_id]
+  ##seperate protein coding and long lncRNAs from short genes
+  pc <- g[g$gene_biotype == "protein_coding"]$gene_id
+  ## separate spliced from unspliced lncRNAs
+  lnc <- g[g$gene_biotype == "lncRNA"]$gene_id
+  g1 <- gtf[gtf$gene_id %in% lnc]
+  e <- g1[g1$type == "exon"]
+  sp <- split(e$exon_number, e$gene_id)
+  ## all lncRNAs with more than 1 exon
+  lnc_spl <- names(sp)[lengths(lapply(sp, unique)) > 1]
+  ## all spliced genes, that need to be checked for potential false positives
+  pc <- c(pc, g[g$gene_id %in% lnc_spl]$gene_id)
+  ## list of small RNAs that might cause the clusters in the long genes
+  ## ## except TEC, MT_rRNA, 
+  ## everything except the protein coding genes and pseudogenes
+  short <- g[!g$gene_biotype %in% c("protein_coding", "processed_pseudogene",
+                                    "unprocessed_pseudogene", "ribozyme",
+                                    "rRNA_pseudogene", "Mt_rRNA", 
+                                    "transcribed_processed_pseudogene", 
+                                    "transcribed_unitary_pseudogene", 
+                                    "transcribed_unprocessed_pseudogene", 
+                                    "unitary_pseudogene",
+                                    "unprocessed_pseudogene", "TEC")]
+  ## remove the long lncRNAs
+  short <- short[!short$gene_id %in% pc]
+  ## go through  the list of genes and determine if all clusters overlap small RNAs
+  res <- lapply(pc, function(i) {
+    clusters <- x[x$gene_id ==i, "cluster_id"]
+    nr_olap <- countOverlaps(all_del_clus_mp[[s]][all_del_clus_mp[[s]]$ID %in% clusters], short,
+                             ignore.strand = FALSE)
+    if(all(nr_olap > 0)){ ## all clusters overlap at least one short RNA
+      return(i)
+    } 
+    return(NULL)
+  })
+  unique(unlist(res)) ## all genes that are no true targets
+})
+names(to_filter_mp) <- names(all_clus_an_mp)
+lengths(to_filter_mp)
+```
+
+```{r filter-target-genes-mp}
+# what are the filtered genes?
+lapply(to_filter_mp, function(x){
+  g <- genes[genes$gene_id %in% x]
+  m <- match(x, g$gene_id)
+  data.frame(gene_id = x, gene_name = g[m]$gene_name, 
+             gene_biotype = g[m]$gene_biotype )
+  })
+lapply(to_filter_mp, function(x) genes[genes$gene_id %in% x]$gene_name)
+
+## remove the wrong targets from the list
+nam <- names(all_clus_an_mp)
+all_clus_an_mp <- lapply(names(all_clus_an_mp), function(x) {
+  all_clus_an_mp[[x]] %>% dplyr::filter(!gene_id %in% to_filter_mp[[x]])
+})
+names(all_clus_an_mp) <- nam
+
+## number of target genes after filtering
+lapply(all_clus_an_mp, function(x) {
+  length(unique(x$gene_id))})
+
+saveRDS(all_clus_an_mp, here("Rmd", "rds", "all_del_clus_an_mp.rds"))
+```
+
+```{r all-del-clusters-mp-hexamer}
+all_sample_an_mp <- lapply(names(all_clus_an_mp), function(n) 
+  prep_an(gtf, all_clus_an_mp[[n]]$gene_id %>% unique))
+names(all_sample_an_mp) <- names(all_clus_an_mp)
+
+## all del clusters within peaks
+z_scores <- oligomer_zscore(wind_size = 61, all_del_clus_mp, all_sample_an_mp, nolig = 6)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTGT"])
+lapply(z_scores, function(x) x["TGTGTG"])
+```
+
