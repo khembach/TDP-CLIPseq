@@ -630,7 +630,7 @@ lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
 lapply(z_scores, function(x) x["GTGTGT"])
 lapply(z_scores, function(x) x["TGTGTG"])
 ```
-Are the top pentamers similar between samples?
+Are the top hexamers similar between samples?
 
 ### Scatterplot {.tabset}
 
@@ -649,6 +649,65 @@ for(i in 1:length(xparam)){
 }
 ```
  
+
+### Histogram and violin plot
+
+z-score vs. hexamer count.
+
+```{r histogram-violin-plot}
+wind_size <- 41
+half_wind <-   half_wind <- (wind_size-1)/2
+nolig <- 6
+  
+## Peak window regions
+wind <- lapply(del_cluster, function(x) 
+  GRanges(seqnames(x), IRanges(start(x)-half_wind, end(x)+half_wind), 
+          strand = strand(x), ID = x$ID))
+wind_seq <- lapply(wind, function(x) getSeq(genome, x))
+
+## oligomer count in window
+obs <- lapply(wind_seq, function(x) {
+  oligonucleotideFrequency(x, width = nolig, step = 1, 
+                                  simplify.as = "collapsed")
+})
+
+## add hexamer counts to table
+dfh <- dfz %>% tidyr::pivot_longer(-hexamer, names_to = "sample", 
+                                   names_prefix = "zscore_", 
+                                   values_to = "zscore") %>%
+  dplyr::left_join(data.frame(hexamer = c(names(obs[["WT"]]), 
+                                          names(obs[["6M"]]), 
+                                          names(obs[["RBDm"]])),
+                              count = c(obs[["WT"]], obs[["6M"]], 
+                                        obs[["RBDm"]]),
+                              sample = c(rep("WT", length(obs[["WT"]])),
+                                         rep("6M", length(obs[["6M"]])),
+                                         rep("RBDm", length(obs[["RBDm"]])))), 
+                   by = c("hexamer", "sample")) %>%
+  dplyr::mutate(sample = factor(sample, level = c("WT", "6M", "RBDm")))
+
+dfh[dfh$hexamer =="GTGTGT",]
+dfh[dfh$hexamer =="TGTGTG",]
+
+p <- dfh %>% ggplot(aes(x = zscore, color = sample, fill = sample)) + 
+  geom_histogram(bins = 200, alpha = 0.6) +
+  theme_bw() + 
+  facet_wrap(~sample, ncol = 1, scales = "free")
+  
+p2 <- dfh %>% ggplot(aes(x = sample, y = zscore)) + 
+  geom_violin() + 
+  geom_boxplot(width=0.1) + 
+  theme_bw() + 
+  geom_text_repel(data = dfh %>% dplyr::filter(hexamer %in% c("GTGTGT", "TGTGTG")),
+             aes(label = hexamer),
+             min.segment.length = 0, segment.color = "grey50",
+             box.padding = 0.5, xlim = c(1.1, NA)) + 
+  facet_wrap(~sample, nrow = 1, scale = "free_x") + 
+  theme(strip.background = element_blank(), strip.text.x = element_blank())
+p
+p2
+```
+ 
  
 ## Hexamer & window 61
 
@@ -662,7 +721,7 @@ lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
 lapply(z_scores, function(x) x["GTGTGT"])
 lapply(z_scores, function(x) x["TGTGTG"])
 ```
-Are the top pentamers similar between samples?
+Are the top hexamers similar between samples?
 
 ### Scatterplot {.tabset}
 
@@ -1088,7 +1147,6 @@ for(i in names(del_cluster)) {
 ```
 
 
-
 ## Hexamer enrichment of del clusters within peaks
 
 ```{r peak-del-clusters-hexamer}
@@ -1114,7 +1172,6 @@ lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
 lapply(z_scores, function(x) x["GTGTGT"])
 lapply(z_scores, function(x) x["TGTGTG"])
 ```
-
 
 
 ## Hexamer enrichment of all del sites within peaks
@@ -1252,3 +1309,175 @@ lapply(z_scores, function(x) x["GTGTGT"])
 lapply(z_scores, function(x) x["TGTGTG"])
 ```
 
+# Number of GU-repeats in cluster
+
+We want to compare the number of GU repeats in clusters within and outside of peaks.
+
+```{r GU-motif-count}
+lapply(del_cluster, length)
+lapply(del_cluster_mp, length)
+
+del_cluster_out <- lapply(names(del_cluster), function(x) {
+  del_cluster[[x]][!del_cluster[[x]]$ID %in% del_cluster_mp[[x]]$ID]})
+names(del_cluster_out) <- names(del_cluster)
+lapply(del_cluster_out, length)
+
+## get the window sequence and count the GU-repeats
+wind_size <- 41
+half_wind <- (wind_size-1)/2
+
+count_motifs <- function(clusters, half_wind, motif1 = "TGTG", motif2 = "GTGT"){
+  ## Peak window regions
+  wind <- lapply(clusters, function(x) 
+    GRanges(seqnames(x), IRanges(start(x)-half_wind, end(x)+half_wind), 
+            strand = strand(x), ID = x$ID))
+  wind_seq <- lapply(wind, function(x) getSeq(genome, x))
+
+  mcount1 <- lapply(wind_seq, function(x) {vcountPattern(motif1, x)})
+  mcount2 <- lapply(wind_seq, function(x) {vcountPattern(motif2, x)})
+  a <- list()
+  a[[motif1]] <- mcount1; a[[motif2]] <- mcount2
+  a
+}
+
+mcount_mp <- count_motifs(del_cluster_mp, half_wind)
+mcount_out <- count_motifs(del_cluster_out, half_wind)
+
+lapply(mcount_mp, function(x) lapply(x, summary))
+lapply(mcount_out, function(x) lapply(x, summary))
+
+mcount_mp_cat <- lapply(mcount_mp, function(x) 
+  lapply(x, function(z) {
+    a <- ifelse(z > 3, ">3", z)
+    factor(a, level = c("0", "1", "2", "3", ">3"))}))
+mcount_out_cat <- lapply(mcount_out, function(x) 
+  lapply(x, function(z) {
+    a <- ifelse(z > 3, ">3", z)
+    factor(a, level = c("0", "1", "2", "3", ">3"))}))
+
+lapply(mcount_mp_cat, function(x) lapply(x, function(y) table(y)/length(y)*100))
+lapply(mcount_out_cat, function(x) lapply(x, function(y) table(y)/length(y)*100))
+```
+
+```{r plot-motif-count, mssagee = FALSE}
+plot_counts <- function(peak_counts, outside_counts, motif = "GTGT") {
+  df <- data.frame(count = unlist(peak_counts[[motif]]), 
+                   sample = rep(names(peak_counts[[motif]]), 
+                                times = lengths(peak_counts[[motif]]))) %>%
+    dplyr::group_by(sample, count) %>%
+    dplyr::summarize(counts = n()) %>%
+    dplyr::mutate(location = "peak")
+  
+  df_out <- data.frame(count = unlist(outside_counts[[motif]]), 
+                   sample = rep(names(outside_counts[[motif]]), 
+                                times = lengths(outside_counts[[motif]]))) %>%
+    dplyr::group_by(sample, count) %>%
+    dplyr::summarize(counts = n()) %>%
+    dplyr::mutate(location = "no peak")
+  
+  p <- rbind(df, df_out) %>% ggplot(aes(x = location, y = counts, fill = count)) + 
+    geom_bar(stat = "identity",
+             position = position_fill(reverse = TRUE)) +
+    facet_wrap(~sample, nrow = 1, scales = "free_x") +
+    ylab("fraction of del. clusters") + labs(fill=paste0(motif, " count"))+ 
+    theme_bw()
+  return(p)
+}
+
+p1 <- plot_counts(mcount_mp_cat, mcount_out_cat, motif = "GTGT")
+p2 <- plot_counts(mcount_mp_cat, mcount_out_cat, motif = "TGTG")
+p1
+p2
+```
+
+## Window 61
+
+```{r motif-count-61}
+wind_size <- 61
+half_wind <- (wind_size-1)/2
+
+mcount_mp <- count_motifs(del_cluster_mp, half_wind)
+mcount_out <- count_motifs(del_cluster_out, half_wind)
+
+lapply(mcount_mp, function(x) lapply(x, summary))
+lapply(mcount_out, function(x) lapply(x, summary))
+
+mcount_mp_cat <- lapply(mcount_mp, function(x) 
+  lapply(x, function(z) {
+    a <- ifelse(z > 3, ">3", z)
+    factor(a, level = c("0", "1", "2", "3", ">3"))}))
+mcount_out_cat <- lapply(mcount_out, function(x) 
+  lapply(x, function(z) {
+    a <- ifelse(z > 3, ">3", z)
+    factor(a, level = c("0", "1", "2", "3", ">3"))}))
+
+## plot
+p1 <- plot_counts(mcount_mp_cat, mcount_out_cat, motif = "GTGT")
+p2 <- plot_counts(mcount_mp_cat, mcount_out_cat, motif = "TGTG")
+p1
+p2
+```
+
+## Window 41 and GTGTGT or TGTGTG
+```{r motif-count-41-hexamer}
+wind_size <- 41
+half_wind <- (wind_size-1)/2
+
+mcount_mp <- count_motifs(del_cluster_mp, half_wind, 
+                          motif1 = "GTGTGT", motif2 = "TGTGTG")
+mcount_out <- count_motifs(del_cluster_out, half_wind, 
+                           motif1 = "GTGTGT", motif2 = "TGTGTG")
+
+lapply(mcount_mp, function(x) lapply(x, summary))
+lapply(mcount_out, function(x) lapply(x, summary))
+
+mcount_mp_cat <- lapply(mcount_mp, function(x) 
+  lapply(x, function(z) {
+    a <- ifelse(z > 3, ">3", z)
+    factor(a, level = c("0", "1", "2", "3", ">3"))}))
+mcount_out_cat <- lapply(mcount_out, function(x) 
+  lapply(x, function(z) {
+    a <- ifelse(z > 3, ">3", z)
+    factor(a, level = c("0", "1", "2", "3", ">3"))}))
+
+## plot
+p1 <- plot_counts(mcount_mp_cat, mcount_out_cat, motif = "GTGTGT")
+p2 <- plot_counts(mcount_mp_cat, mcount_out_cat, motif = "TGTGTG")
+p1
+p2
+```
+
+
+## Window 61 and GTGTGT or TGTGTG
+```{r motif-count-61-hexamer}
+wind_size <- 61
+half_wind <- (wind_size-1)/2
+
+mcount_mp <- count_motifs(del_cluster_mp, half_wind, 
+                          motif1 = "GTGTGT", motif2 = "TGTGTG")
+mcount_out <- count_motifs(del_cluster_out, half_wind, 
+                           motif1 = "GTGTGT", motif2 = "TGTGTG")
+
+lapply(mcount_mp, function(x) lapply(x, summary))
+lapply(mcount_out, function(x) lapply(x, summary))
+
+mcount_mp_cat <- lapply(mcount_mp, function(x) 
+  lapply(x, function(z) {
+    a <- ifelse(z > 3, ">3", z)
+    factor(a, level = c("0", "1", "2", "3", ">3"))}))
+mcount_out_cat <- lapply(mcount_out, function(x) 
+  lapply(x, function(z) {
+    a <- ifelse(z > 3, ">3", z)
+    factor(a, level = c("0", "1", "2", "3", ">3"))}))
+
+## plot
+p1 <- plot_counts(mcount_mp_cat, mcount_out_cat, motif = "GTGTGT")
+p2 <- plot_counts(mcount_mp_cat, mcount_out_cat, motif = "TGTGTG")
+p1
+p2
+```
+
+
+```{r}
+sessionInfo()
+```
